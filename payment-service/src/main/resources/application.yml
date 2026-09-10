@@ -23,12 +23,16 @@ spring:
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
       properties:
         enable.idempotence: true
+    template:
+      observation-enabled: true
 
 security:
   jwt:
     issuer: ${JWT_ISSUER_URI:https://auth.example.com/}
     audience: ${JWT_AUDIENCE:payment-api}
     jwk-set-uri: ${JWT_JWK_SET_URI:http://localhost:9000/oauth2/jwks}
+  observability:
+    public-prometheus: ${OBSERVABILITY_PUBLIC_PROMETHEUS:false}
 
 springdoc:
   api-docs:
@@ -60,6 +64,35 @@ management:
   endpoint:
     health:
       show-details: when-authorized
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+      environment: ${DEPLOYMENT_ENVIRONMENT:local}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        payments.outbox.publish.latency: true
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+    export:
+      otlp:
+        enabled: ${OTEL_TRACING_ENABLED:false}
+    exemplars:
+      include: sampled-traces
+  opentelemetry:
+    resource-attributes:
+      service.name: ${spring.application.name}
+      service.namespace: event-driven-payment-platform
+      deployment.environment: ${DEPLOYMENT_ENVIRONMENT:local}
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
 
 server:
   port: ${PORT:8080}
