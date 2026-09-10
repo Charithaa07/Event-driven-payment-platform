@@ -1,5 +1,7 @@
 package com.charitha.payments.idempotency;
 
+import com.charitha.payments.domain.Payment;
+import com.charitha.payments.domain.PaymentStatus;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -9,7 +11,10 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
+import tools.jackson.databind.json.JsonMapper;
 
+import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -23,6 +28,7 @@ class RedisIdempotencyStoreIntegrationTest {
 
     private static LettuceConnectionFactory connectionFactory;
     private static StringRedisTemplate redisTemplate;
+    private static JsonMapper jsonMapper;
 
     @BeforeAll
     static void setUpRedisClient() {
@@ -30,6 +36,7 @@ class RedisIdempotencyStoreIntegrationTest {
         connectionFactory.afterPropertiesSet();
         connectionFactory.start();
         redisTemplate = new StringRedisTemplate(connectionFactory);
+        jsonMapper = JsonMapper.builder().build();
     }
 
     @AfterAll
@@ -40,14 +47,30 @@ class RedisIdempotencyStoreIntegrationTest {
     }
 
     @Test
-    void storesPaymentIdWithTtlAndReadsItBack() {
-        RedisIdempotencyStore store = new RedisIdempotencyStore(redisTemplate, 1);
+    void storesCompletePaymentResponseWithTtlAndReadsItBack() {
+        RedisIdempotencyStore store = new RedisIdempotencyStore(redisTemplate, jsonMapper, 1);
         String idempotencyKey = "checkout-redis-1";
-        UUID paymentId = UUID.randomUUID();
+        Payment payment = new Payment(
+                UUID.randomUUID(),
+                idempotencyKey,
+                new BigDecimal("42.50"),
+                "USD",
+                "customer-1",
+                PaymentStatus.ACCEPTED,
+                Instant.parse("2026-09-10T17:00:00Z")
+        );
 
-        store.put(idempotencyKey, paymentId);
+        store.put(idempotencyKey, payment);
 
-        assertEquals(paymentId, store.findPaymentId(idempotencyKey).orElseThrow());
+        Payment cached = store.findPayment(idempotencyKey).orElseThrow();
+        assertEquals(payment.getId(), cached.getId());
+        assertEquals(payment.getIdempotencyKey(), cached.getIdempotencyKey());
+        assertEquals(payment.getAmount(), cached.getAmount());
+        assertEquals(payment.getCurrency(), cached.getCurrency());
+        assertEquals(payment.getCustomerId(), cached.getCustomerId());
+        assertEquals(payment.getStatus(), cached.getStatus());
+        assertEquals(payment.getCreatedAt(), cached.getCreatedAt());
+
         Long ttlSeconds = redisTemplate.getExpire(
                 RedisIdempotencyStore.redisKey(idempotencyKey),
                 TimeUnit.SECONDS
@@ -58,12 +81,12 @@ class RedisIdempotencyStoreIntegrationTest {
 
     @Test
     void malformedCachedValueIsEvictedAndTreatedAsMiss() {
-        RedisIdempotencyStore store = new RedisIdempotencyStore(redisTemplate, 1);
+        RedisIdempotencyStore store = new RedisIdempotencyStore(redisTemplate, jsonMapper, 1);
         String idempotencyKey = "checkout-malformed";
         String redisKey = RedisIdempotencyStore.redisKey(idempotencyKey);
-        redisTemplate.opsForValue().set(redisKey, "not-a-payment-id");
+        redisTemplate.opsForValue().set(redisKey, "not-json");
 
-        assertTrue(store.findPaymentId(idempotencyKey).isEmpty());
+        assertTrue(store.findPayment(idempotencyKey).isEmpty());
         assertFalse(Boolean.TRUE.equals(redisTemplate.hasKey(redisKey)));
     }
 }
