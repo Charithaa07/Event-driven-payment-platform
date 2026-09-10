@@ -1,4 +1,4 @@
-package com.veda.payments.domain;
+package com.charitha.payments.domain;
 
 import jakarta.persistence.*;
 import java.math.BigDecimal;

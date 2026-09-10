@@ -1,4 +1,4 @@
-package com.veda.payments.messaging;
+package com.charitha.payments.messaging;
 
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;

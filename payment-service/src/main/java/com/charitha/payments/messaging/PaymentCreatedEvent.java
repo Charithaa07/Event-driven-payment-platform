@@ -1,4 +1,4 @@
-package com.veda.payments.messaging;
+package com.charitha.payments.messaging;
 
 import java.math.BigDecimal;
 import java.time.Instant;

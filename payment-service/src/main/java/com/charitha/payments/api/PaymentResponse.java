@@ -1,6 +1,6 @@
-package com.veda.payments.api;
+package com.charitha.payments.api;
 
-import com.veda.payments.domain.Payment;
+import com.charitha.payments.domain.Payment;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.UUID;

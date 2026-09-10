@@ -1,4 +1,4 @@
-package com.veda.payments.outbox;
+package com.charitha.payments.outbox;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;

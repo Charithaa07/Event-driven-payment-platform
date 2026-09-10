@@ -1,6 +1,6 @@
-package com.veda.payments.api;
+package com.charitha.payments.api;
 
-import com.veda.payments.service.PaymentService;
+import com.charitha.payments.service.PaymentService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;

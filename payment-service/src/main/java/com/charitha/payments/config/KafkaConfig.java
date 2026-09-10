@@ -1,6 +1,6 @@
-package com.veda.payments.config;
+package com.charitha.payments.config;
 
-import com.veda.payments.messaging.PaymentCreatedEvent;
+import com.charitha.payments.messaging.PaymentCreatedEvent;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.beans.factory.annotation.Value;

@@ -1,6 +1,6 @@
-package com.veda.payments.api;
+package com.charitha.payments.api;
 
-import com.veda.payments.service.PaymentNotFoundException;
+import com.charitha.payments.service.PaymentNotFoundException;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.ResponseStatus;

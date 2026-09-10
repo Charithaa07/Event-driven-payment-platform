@@ -1,4 +1,4 @@
-package com.veda.payments.outbox;
+package com.charitha.payments.outbox;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import java.util.List;

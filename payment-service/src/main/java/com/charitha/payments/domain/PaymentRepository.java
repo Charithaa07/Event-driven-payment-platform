@@ -1,4 +1,4 @@
-package com.veda.payments.domain;
+package com.charitha.payments.domain;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import java.util.Optional;

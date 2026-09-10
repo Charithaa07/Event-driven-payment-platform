@@ -1,12 +1,12 @@
-package com.veda.payments.service;
+package com.charitha.payments.service;
 
-import com.veda.payments.api.CreatePaymentRequest;
-import com.veda.payments.domain.Payment;
-import com.veda.payments.domain.PaymentRepository;
-import com.veda.payments.domain.PaymentStatus;
-import com.veda.payments.messaging.PaymentCreatedEvent;
-import com.veda.payments.outbox.OutboxEvent;
-import com.veda.payments.outbox.OutboxEventRepository;
+import com.charitha.payments.api.CreatePaymentRequest;
+import com.charitha.payments.domain.Payment;
+import com.charitha.payments.domain.PaymentRepository;
+import com.charitha.payments.domain.PaymentStatus;
+import com.charitha.payments.messaging.PaymentCreatedEvent;
+import com.charitha.payments.outbox.OutboxEvent;
+import com.charitha.payments.outbox.OutboxEventRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.core.JacksonException;

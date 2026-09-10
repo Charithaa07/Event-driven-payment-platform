@@ -1,4 +1,4 @@
-package com.veda.payments.api;
+package com.charitha.payments.api;
 
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotBlank;

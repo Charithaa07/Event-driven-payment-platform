@@ -1,9 +1,9 @@
-package com.veda.payments.service;
+package com.charitha.payments.service;
 
-import com.veda.payments.api.CreatePaymentRequest;
-import com.veda.payments.domain.Payment;
-import com.veda.payments.domain.PaymentRepository;
-import com.veda.payments.outbox.OutboxEventRepository;
+import com.charitha.payments.api.CreatePaymentRequest;
+import com.charitha.payments.domain.Payment;
+import com.charitha.payments.domain.PaymentRepository;
+import com.charitha.payments.outbox.OutboxEventRepository;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.json.JsonMapper;
 

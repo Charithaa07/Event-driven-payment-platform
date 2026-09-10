@@ -1,4 +1,4 @@
-package com.veda.payments.outbox;
+package com.charitha.payments.outbox;
 
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;

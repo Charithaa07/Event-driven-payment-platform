@@ -1,4 +1,4 @@
-package com.veda.payments.service;
+package com.charitha.payments.service;
 
 import java.util.UUID;
 
