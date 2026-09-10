@@ -23,7 +23,6 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
 import java.math.BigDecimal;
-import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -32,7 +31,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -84,8 +82,9 @@ class PaymentServiceIntegrationTest {
         CreatePaymentRequest request = request("42.50");
         CountDownLatch ready = new CountDownLatch(2);
         CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
 
-        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+        try {
             Future<Payment> first = executor.submit(() -> createAfterBarrier(key, request, ready, start));
             Future<Payment> second = executor.submit(() -> createAfterBarrier(key, request, ready, start));
 
@@ -98,6 +97,9 @@ class PaymentServiceIntegrationTest {
             assertEquals(firstResult.getId(), secondResult.getId());
             assertEquals(1L, paymentRepository.count());
             assertEquals(1L, outboxRepository.count());
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
         }
     }
 
