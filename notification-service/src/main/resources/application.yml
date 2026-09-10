@@ -1,0 +1,87 @@
+spring:
+  application:
+    name: notification-service
+  datasource:
+    url: ${NOTIFICATION_DB_URL:jdbc:postgresql://localhost:5435/notifications}
+    username: ${NOTIFICATION_DB_USER:notifications}
+    password: ${NOTIFICATION_DB_PASSWORD:notifications}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: notification-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    listener:
+      ack-mode: record
+      observation-enabled: true
+    template:
+      observation-enabled: true
+
+topics:
+  payment-created: payments.created.v1
+
+notifications:
+  dispatch:
+    fixed-delay-ms: ${NOTIFICATION_DISPATCH_FIXED_DELAY_MS:1000}
+    batch-size: ${NOTIFICATION_DISPATCH_BATCH_SIZE:25}
+    max-attempts: ${NOTIFICATION_MAX_ATTEMPTS:4}
+    base-backoff-ms: ${NOTIFICATION_BASE_BACKOFF_MS:5000}
+    max-backoff-ms: ${NOTIFICATION_MAX_BACKOFF_MS:60000}
+    lease-timeout-ms: ${NOTIFICATION_LEASE_TIMEOUT_MS:120000}
+
+security:
+  jwt:
+    issuer: ${JWT_ISSUER_URI:https://auth.example.com/}
+    audience: ${NOTIFICATION_JWT_AUDIENCE:notification-api}
+    jwk-set-uri: ${JWT_JWK_SET_URI:http://localhost:9000/oauth2/jwks}
+  observability:
+    public-prometheus: ${OBSERVABILITY_PUBLIC_PROMETHEUS:false}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+      environment: ${DEPLOYMENT_ENVIRONMENT:local}
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+    export:
+      otlp:
+        enabled: ${OTEL_TRACING_ENABLED:false}
+  opentelemetry:
+    resource-attributes:
+      service.name: ${spring.application.name}
+      service.namespace: event-driven-payment-platform
+      deployment.environment: ${DEPLOYMENT_ENVIRONMENT:local}
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+
+server:
+  port: ${PORT:8083}
