@@ -40,7 +40,7 @@ public class PaymentService {
 
     @Transactional
     public Payment create(String idempotencyKey, CreatePaymentRequest request) {
-        Optional<Payment> cachedPayment = findCachedPayment(idempotencyKey);
+        Optional<Payment> cachedPayment = idempotencyStore.findPayment(idempotencyKey);
         if (cachedPayment.isPresent()) {
             return cachedPayment.get();
         }
@@ -48,12 +48,12 @@ public class PaymentService {
         Optional<Payment> persistedPayment = repository.findByIdempotencyKey(idempotencyKey);
         if (persistedPayment.isPresent()) {
             Payment payment = persistedPayment.get();
-            idempotencyStore.put(idempotencyKey, payment.getId());
+            idempotencyStore.put(idempotencyKey, payment);
             return payment;
         }
 
         Payment created = createNew(idempotencyKey, request);
-        cacheAfterCommit(idempotencyKey, created.getId());
+        cacheAfterCommit(idempotencyKey, created);
         return created;
     }
 
@@ -61,19 +61,6 @@ public class PaymentService {
     public Payment get(UUID paymentId) {
         return repository.findById(paymentId)
                 .orElseThrow(() -> new PaymentNotFoundException(paymentId));
-    }
-
-    private Optional<Payment> findCachedPayment(String idempotencyKey) {
-        Optional<UUID> cachedPaymentId = idempotencyStore.findPaymentId(idempotencyKey);
-        if (cachedPaymentId.isEmpty()) {
-            return Optional.empty();
-        }
-
-        Optional<Payment> payment = repository.findById(cachedPaymentId.get());
-        if (payment.isEmpty()) {
-            idempotencyStore.evict(idempotencyKey);
-        }
-        return payment;
     }
 
     private Payment createNew(String idempotencyKey, CreatePaymentRequest request) {
@@ -111,16 +98,16 @@ public class PaymentService {
         return saved;
     }
 
-    private void cacheAfterCommit(String idempotencyKey, UUID paymentId) {
+    private void cacheAfterCommit(String idempotencyKey, Payment payment) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            idempotencyStore.put(idempotencyKey, paymentId);
+            idempotencyStore.put(idempotencyKey, payment);
             return;
         }
 
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                idempotencyStore.put(idempotencyKey, paymentId);
+                idempotencyStore.put(idempotencyKey, payment);
             }
         });
     }
