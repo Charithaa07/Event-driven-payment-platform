@@ -7,10 +7,11 @@ import com.veda.payments.domain.PaymentStatus;
 import com.veda.payments.messaging.PaymentCreatedEvent;
 import com.veda.payments.outbox.OutboxEvent;
 import com.veda.payments.outbox.OutboxEventRepository;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.json.JsonMapper;
+
 import java.time.Instant;
 import java.util.UUID;
 
@@ -20,14 +21,14 @@ public class PaymentService {
 
     private final PaymentRepository repository;
     private final OutboxEventRepository outboxRepository;
-    private final ObjectMapper objectMapper;
+    private final JsonMapper jsonMapper;
 
     public PaymentService(PaymentRepository repository,
                           OutboxEventRepository outboxRepository,
-                          ObjectMapper objectMapper) {
+                          JsonMapper jsonMapper) {
         this.repository = repository;
         this.outboxRepository = outboxRepository;
-        this.objectMapper = objectMapper;
+        this.jsonMapper = jsonMapper;
     }
 
     @Transactional
@@ -79,8 +80,8 @@ public class PaymentService {
 
     private String serialize(PaymentCreatedEvent event) {
         try {
-            return objectMapper.writeValueAsString(event);
-        } catch (JsonProcessingException ex) {
+            return jsonMapper.writeValueAsString(event);
+        } catch (JacksonException ex) {
             throw new IllegalStateException("Failed to serialize payment event", ex);
         }
     }
