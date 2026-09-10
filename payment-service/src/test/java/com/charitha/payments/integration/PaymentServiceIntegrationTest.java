@@ -134,8 +134,9 @@ class PaymentServiceIntegrationTest {
     }
 
     @Test
-    void committedPaymentWarmsRedisAndPersistsOutboxAtomically() {
+    void committedPaymentWarmsRedisPersistsOutboxAndIsClaimable() {
         String key = "commit-" + UUID.randomUUID();
+        TransactionTemplate template = new TransactionTemplate(transactionManager);
 
         Payment created = paymentService.create(key, request("42.50"));
 
@@ -143,6 +144,9 @@ class PaymentServiceIntegrationTest {
         assertEquals(1L, outboxRepository.count());
         Payment cached = idempotencyStore.findPayment(key).orElseThrow();
         assertEquals(created.getId(), cached.getId());
+
+        Integer claimableCount = template.execute(status -> outboxRepository.findClaimableBatch().size());
+        assertEquals(1, claimableCount);
     }
 
     private Payment createAfterBarrier(String key,
