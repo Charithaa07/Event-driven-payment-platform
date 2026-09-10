@@ -2,7 +2,7 @@
 
 A portfolio-grade payment processing backend focused on the engineering concerns that matter in real distributed systems: **idempotent APIs, durable persistence, event-driven workflows, failure isolation, observability, and clear service boundaries**.
 
-> Status: Phase 2 — Payment command service + transactional outbox are implemented. Transaction consumer, retry/DLQ, auth, observability, and deployment modules are next.
+> Status: Phase 3 — Payment command service, transactional outbox, and idempotent transaction consumer are implemented. Retry/DLQ, auth, observability, and deployment modules are next.
 
 ## Why this project exists
 
@@ -13,31 +13,64 @@ Payment APIs look simple until retries, duplicate requests, partial failures, as
 ```mermaid
 flowchart LR
     C[Client] -->|POST /api/v1/payments| P[Payment Service]
-    P -->|same DB transaction| PG[(PostgreSQL)]
+    P -->|same DB transaction| PG[(Payment PostgreSQL)]
     PG --> O[(Outbox Events)]
     O --> RLY[Outbox Relay]
     RLY --> K[(Kafka)]
+    K --> T[Transaction Service]
+    T --> TG[(Transaction PostgreSQL)]
+    T --> PE[(Processed Events)]
     P -. planned .-> R[(Redis)]
-    K -. next .-> T[Transaction Service]
     K -. planned .-> N[Notification Service]
     K -. planned .-> A[Audit Service]
 ```
 
 ## Implemented
 
-- Java 17 + Spring Boot backend
-- Versioned REST API
+- Java 17 + Spring Boot services
+- Versioned payment REST API
 - `Idempotency-Key` support backed by a database uniqueness guarantee
 - PostgreSQL persistence with Flyway migrations
-- Transactional outbox table written in the same transaction as the payment
+- Transactional outbox written in the same database transaction as the payment
 - Scheduled outbox relay publishing `payments.created.v1` events to Kafka
 - At-least-once event delivery semantics
-- Idempotent Kafka producer configuration
-- Request validation and API exception handling
+- Separate Transaction Service with its own PostgreSQL datastore
+- Idempotent Kafka consumer using durable `processed_events` records
+- Kafka acknowledgement only after the local transaction completes
+- Payment-level uniqueness guard to prevent duplicate transaction rows
 - Spring Boot Actuator health/metrics endpoints
-- Unit test covering duplicate-request behavior
-- Docker Compose for PostgreSQL, Redis, and Kafka
+- Unit tests covering API idempotency and duplicate event consumption
+- Docker Compose for both PostgreSQL datastores, Redis, and Kafka
 - GitHub Actions Maven CI
+
+## Reliability flow
+
+```text
+HTTP payment request
+        ↓
+Payment Service
+        ↓
+BEGIN DB TRANSACTION
+  ├── INSERT payment
+  └── INSERT outbox event
+COMMIT
+        ↓
+Outbox Relay
+        ↓
+Kafka: payments.created.v1
+        ↓
+Transaction Service
+        ↓
+BEGIN DB TRANSACTION
+  ├── check processed_events(event_id)
+  ├── INSERT payment_transaction
+  └── INSERT processed_event
+COMMIT
+        ↓
+acknowledge Kafka offset
+```
+
+This design intentionally supports **at-least-once delivery**. If the consumer commits its database transaction but crashes before acknowledging Kafka, the event may be delivered again. The `processed_events` table makes that redelivery safe.
 
 ## API
 
@@ -69,52 +102,48 @@ Prerequisites: Java 17+, Maven, Docker.
 ```bash
 docker compose up -d
 mvn spring-boot:run -pl payment-service
+mvn spring-boot:run -pl transaction-service
 ```
 
-Health endpoint:
+Payment Service health:
 
 ```bash
 curl http://localhost:8080/actuator/health
 ```
 
+Transaction Service health:
+
+```bash
+curl http://localhost:8081/actuator/health
+```
+
 ## Engineering decisions
 
-### Idempotency
+### Request idempotency
 
-Client retries are normal in payment systems. The API accepts an `Idempotency-Key`, persists it with a unique database constraint, and reuses the original payment for repeated requests. A later phase will add Redis as a fast-path while PostgreSQL remains the durability boundary.
+Client retries are normal in payment systems. The Payment Service accepts an `Idempotency-Key`, persists it with a unique database constraint, and reuses the original payment for repeated requests. A later phase will add Redis as a fast-path while PostgreSQL remains the durability boundary.
 
-### Why a transactional outbox?
+### Transactional outbox
 
 A direct `save payment -> publish Kafka` flow creates a dual-write problem: the database commit may succeed while Kafka publication fails. The payment would then exist without the corresponding domain event.
 
-The current flow persists both the payment and its outbox record inside the same database transaction:
+The current flow persists both the payment and its outbox record inside the same database transaction. If Kafka is unavailable, the outbox event stays `PENDING` and the relay can publish it later.
 
-```text
-HTTP request
-   ↓
-PaymentService
-   ↓
-BEGIN TRANSACTION
-   ├── INSERT payment
-   └── INSERT outbox event
-COMMIT
-   ↓
-OutboxRelay
-   ↓
-Kafka: payments.created.v1
-```
+### Idempotent consumer
 
-This makes the database the durable boundary. If Kafka is unavailable, the outbox event remains `PENDING` and the relay can attempt publication again.
+The Transaction Service stores processed Kafka event IDs in its own PostgreSQL database. The transaction row and the processed-event marker are committed together. Kafka is acknowledged only after processing completes.
 
-### Delivery semantics
+This means a crash between database commit and Kafka acknowledgement may cause redelivery, but the same event cannot reproduce the business side effect.
 
-The relay currently provides **at-least-once delivery**. A process failure can occur after Kafka acknowledges an event but before the outbox row is marked `PUBLISHED`, so the same event can be emitted again. That is expected rather than hidden.
+The service also enforces uniqueness on `payment_id` and `source_event_id`, providing a second database-level guard against duplicate writes.
 
-The next transaction-service consumer will therefore use the immutable `eventId` as an idempotency key and persist processed event IDs so duplicate Kafka deliveries do not duplicate business effects.
+### Service data ownership
+
+Payment and transaction records live in separate PostgreSQL databases. This keeps the services from reading or mutating each other's tables directly and makes Kafka the integration boundary between them.
 
 ### Current relay trade-off
 
-The first relay implementation polls small batches from PostgreSQL and publishes them synchronously before marking each event complete. This keeps the failure model easy to inspect. A later scale-oriented iteration can add row claiming / `SKIP LOCKED`, backoff, terminal failure states, and concurrent relay workers.
+The outbox relay polls small batches from PostgreSQL and publishes them synchronously before marking each event complete. This keeps the failure model easy to inspect. A later scale-oriented iteration can add row claiming / `SKIP LOCKED`, backoff, terminal failure states, and concurrent relay workers.
 
 ## Roadmap
 
@@ -122,8 +151,9 @@ The first relay implementation polls small batches from PostgreSQL and publishes
 - [x] PostgreSQL + Flyway
 - [x] Transactional outbox pattern
 - [x] Kafka outbox relay
+- [x] Idempotent Transaction Service Kafka consumer
+- [x] Separate service-owned transaction datastore
 - [x] Base CI pipeline
-- [ ] Idempotent transaction-service Kafka consumer
 - [ ] Retry topics + dead-letter queue
 - [ ] Notification service
 - [ ] Audit service
@@ -150,10 +180,10 @@ The first relay implementation polls small batches from PostgreSQL and publishes
 event-driven-payment-platform/
 ├── payment-service/
 │   ├── src/main/java/com/charitha/payments/
-│   │   ├── api/
-│   │   ├── domain/
-│   │   ├── outbox/
-│   │   └── service/
+│   ├── src/main/resources/db/migration/
+│   └── src/test/
+├── transaction-service/
+│   ├── src/main/java/com/charitha/transactions/
 │   ├── src/main/resources/db/migration/
 │   └── src/test/
 ├── docs/
