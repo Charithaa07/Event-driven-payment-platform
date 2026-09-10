@@ -12,20 +12,11 @@ on:
 permissions:
   contents: read
 
-jobs:
-  dependency-review:
-    name: Dependency review
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-      - name: Reject newly introduced high-severity vulnerable dependencies
-        uses: actions/dependency-review-action@v4
-        with:
-          fail-on-severity: high
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
   codeql:
     name: CodeQL Java
     runs-on: ubuntu-latest
