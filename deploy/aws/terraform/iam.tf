@@ -2,23 +2,23 @@ locals {
   workload_roles = {
     payment = {
       service_account = "payment-platform-payment"
-      topics           = ["payments.created.v1"]
-      groups           = []
+      topics          = ["payments.created.v1"]
+      groups          = []
     }
     transaction = {
       service_account = "payment-platform-transaction"
-      topics           = ["payments.created.v1", "payments.created.v1.DLT"]
-      groups           = ["transaction-service*"]
+      topics          = ["payments.created.v1", "payments.created.v1.DLT"]
+      groups          = ["transaction-service*"]
     }
     audit = {
       service_account = "payment-platform-audit"
-      topics           = ["payments.created.v1", "payments.created.v1.audit.DLT"]
-      groups           = ["audit-service*"]
+      topics          = ["payments.created.v1", "payments.created.v1.audit.DLT"]
+      groups          = ["audit-service*"]
     }
     notification = {
       service_account = "payment-platform-notification"
-      topics           = ["payments.created.v1", "payments.created.v1.notification.DLT"]
-      groups           = ["notification-service*"]
+      topics          = ["payments.created.v1", "payments.created.v1.notification.DLT"]
+      groups          = ["notification-service*"]
     }
   }
 
@@ -50,9 +50,9 @@ data "aws_iam_policy_document" "workload_msk" {
   for_each = local.workload_roles
 
   statement {
-    sid     = "ClusterConnection"
-    effect  = "Allow"
-    actions = ["kafka-cluster:Connect", "kafka-cluster:DescribeCluster"]
+    sid       = "ClusterConnection"
+    effect    = "Allow"
+    actions   = ["kafka-cluster:Connect", "kafka-cluster:DescribeCluster"]
     resources = [local.msk_cluster_arn]
   }
 
