@@ -4,3 +4,12 @@
 *.iml
 .DS_Store
 .env
+
+# Terraform local state/cache
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraformrc
+terraform.rc
+crash.log
