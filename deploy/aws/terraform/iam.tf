@@ -3,21 +3,29 @@ locals {
     payment = {
       service_account = "payment-platform-payment"
       topics          = ["payments.created.v1"]
+      read_topics     = []
+      write_topics    = ["payments.created.v1"]
       groups          = []
     }
     transaction = {
       service_account = "payment-platform-transaction"
       topics          = ["payments.created.v1", "payments.created.v1.DLT"]
+      read_topics     = ["payments.created.v1", "payments.created.v1.DLT"]
+      write_topics    = ["payments.created.v1", "payments.created.v1.DLT"]
       groups          = ["transaction-service*"]
     }
     audit = {
       service_account = "payment-platform-audit"
       topics          = ["payments.created.v1", "payments.created.v1.audit.DLT"]
+      read_topics     = ["payments.created.v1"]
+      write_topics    = ["payments.created.v1.audit.DLT"]
       groups          = ["audit-service*"]
     }
     notification = {
       service_account = "payment-platform-notification"
       topics          = ["payments.created.v1", "payments.created.v1.notification.DLT"]
+      read_topics     = ["payments.created.v1"]
+      write_topics    = ["payments.created.v1.notification.DLT"]
       groups          = ["notification-service*"]
     }
   }
@@ -57,18 +65,39 @@ data "aws_iam_policy_document" "workload_msk" {
   }
 
   statement {
-    sid    = "TopicAccess"
-    effect = "Allow"
-    actions = [
-      "kafka-cluster:CreateTopic",
-      "kafka-cluster:DescribeTopic",
-      "kafka-cluster:ReadData",
-      "kafka-cluster:WriteData"
-    ]
+    sid     = "TopicMetadataAndCreation"
+    effect  = "Allow"
+    actions = ["kafka-cluster:CreateTopic", "kafka-cluster:DescribeTopic"]
     resources = [
       for topic in each.value.topics :
       "arn:${data.aws_partition.current.partition}:kafka:${var.aws_region}:${data.aws_caller_identity.current.account_id}:topic/${aws_msk_serverless_cluster.main.cluster_name}/*/${topic}"
     ]
+  }
+
+  dynamic "statement" {
+    for_each = length(each.value.read_topics) > 0 ? [1] : []
+    content {
+      sid     = "TopicRead"
+      effect  = "Allow"
+      actions = ["kafka-cluster:ReadData"]
+      resources = [
+        for topic in each.value.read_topics :
+        "arn:${data.aws_partition.current.partition}:kafka:${var.aws_region}:${data.aws_caller_identity.current.account_id}:topic/${aws_msk_serverless_cluster.main.cluster_name}/*/${topic}"
+      ]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = length(each.value.write_topics) > 0 ? [1] : []
+    content {
+      sid     = "TopicWrite"
+      effect  = "Allow"
+      actions = ["kafka-cluster:WriteData"]
+      resources = [
+        for topic in each.value.write_topics :
+        "arn:${data.aws_partition.current.partition}:kafka:${var.aws_region}:${data.aws_caller_identity.current.account_id}:topic/${aws_msk_serverless_cluster.main.cluster_name}/*/${topic}"
+      ]
+    }
   }
 
   dynamic "statement" {
