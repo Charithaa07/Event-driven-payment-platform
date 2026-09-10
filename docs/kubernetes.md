@@ -81,6 +81,20 @@ helm upgrade --install payment-platform deploy/helm/payment-platform \
 
 Use versioned or digest-pinned image tags for shared environments instead of `latest`.
 
+## Verify a rollout
+
+After installation, verify that every workload becomes available and that autoscaling/disruption policies are present:
+
+```bash
+kubectl -n payments get deployments,pods,services,hpa,pdb
+kubectl -n payments rollout status deployment/payment-platform-payment-platform-payment
+kubectl -n payments rollout status deployment/payment-platform-payment-platform-transaction
+kubectl -n payments rollout status deployment/payment-platform-payment-platform-audit
+kubectl -n payments rollout status deployment/payment-platform-payment-platform-notification
+```
+
+For a custom Helm release name or `fullnameOverride`, derive the exact Deployment names from `kubectl get deployments` rather than assuming the examples above.
+
 ## Runtime correctness notes
 
 Kubernetes improves process availability but does not change the platform's messaging guarantees. Payment outbox publication remains at least once, Transaction/Audit/Notification consumers remain idempotent at their database boundaries, and notification provider delivery still depends on the stable provider idempotency key for crash-after-send recovery.
