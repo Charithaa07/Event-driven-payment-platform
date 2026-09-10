@@ -50,7 +50,7 @@ public class RedisIdempotencyStore {
         } catch (DataAccessException ex) {
             log.warn("Redis idempotency lookup failed; falling back to PostgreSQL", ex);
             return Optional.empty();
-        } catch (JacksonException | RuntimeException ex) {
+        } catch (RuntimeException ex) {
             log.warn("Ignoring malformed Redis idempotency value for key {}", idempotencyKey);
             evict(idempotencyKey);
             return Optional.empty();
