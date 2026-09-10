@@ -18,3 +18,12 @@ data:
   MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
   SERVER_SHUTDOWN: graceful
   SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 20s
+  {{- if .Values.global.kafkaIamAuthEnabled }}
+  SPRING_KAFKA_PROPERTIES_SECURITY_PROTOCOL: SASL_SSL
+  SPRING_KAFKA_PROPERTIES_SASL_MECHANISM: AWS_MSK_IAM
+  SPRING_KAFKA_PROPERTIES_SASL_JAAS_CONFIG: "software.amazon.msk.auth.iam.IAMLoginModule required;"
+  SPRING_KAFKA_PROPERTIES_SASL_CLIENT_CALLBACK_HANDLER_CLASS: software.amazon.msk.auth.iam.IAMClientCallbackHandler
+  {{- end }}
+  {{- if .Values.global.redisSslEnabled }}
+  SPRING_DATA_REDIS_SSL_ENABLED: "true"
+  {{- end }}
