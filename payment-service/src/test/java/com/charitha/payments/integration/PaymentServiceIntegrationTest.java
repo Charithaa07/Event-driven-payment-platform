@@ -263,6 +263,28 @@ class PaymentServiceIntegrationTest {
                 .andExpect(status().isOk());
     }
 
+    @Test
+    void openApiContractIsPublicAndDocumentsBearerSecurity() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.openapi").exists())
+                .andExpect(jsonPath("$.info.title").value("Event-Driven Payment Platform API"))
+                .andExpect(jsonPath("$.info.version").value("v1"))
+                .andExpect(jsonPath("$.components.securitySchemes.bearerAuth.type").value("http"))
+                .andExpect(jsonPath("$.components.securitySchemes.bearerAuth.scheme").value("bearer"))
+                .andExpect(jsonPath("$.paths['/api/v1/payments'].post.responses['201']").exists())
+                .andExpect(jsonPath("$.paths['/api/v1/payments'].post.responses['409']").exists())
+                .andExpect(jsonPath("$.paths['/api/v1/payments'].post.parameters[0].name").value("Idempotency-Key"))
+                .andExpect(jsonPath("$.paths['/api/v1/payments'].post.security[0].bearerAuth").isArray())
+                .andExpect(jsonPath("$.paths['/api/v1/payments/{paymentId}'].get.responses['404']").exists());
+    }
+
+    @Test
+    void swaggerUiEntryPointIsPublic() throws Exception {
+        mockMvc.perform(get("/swagger-ui.html"))
+                .andExpect(status().is3xxRedirection());
+    }
+
     private Payment createAfterBarrier(String key,
                                        CreatePaymentRequest request,
                                        String customerId,

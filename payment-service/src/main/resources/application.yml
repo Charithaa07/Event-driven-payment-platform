@@ -30,6 +30,15 @@ security:
     audience: ${JWT_AUDIENCE:payment-api}
     jwk-set-uri: ${JWT_JWK_SET_URI:http://localhost:9000/oauth2/jwks}
 
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+    display-request-duration: true
+
 idempotency:
   redis:
     ttl-hours: ${IDEMPOTENCY_REDIS_TTL_HOURS:24}
