@@ -135,8 +135,7 @@ class PaymentEventFlowIntegrationTest {
 
         try (KafkaConsumer<String, String> consumer = deadLetterConsumer()) {
             consumer.subscribe(List.of(PAYMENT_CREATED_DLT));
-            ConsumerRecord<String, String> deadLetter = awaitRecord(consumer, Duration.ofSeconds(15));
-            assertEquals(key, deadLetter.key());
+            ConsumerRecord<String, String> deadLetter = awaitRecordWithKey(consumer, key, Duration.ofSeconds(15));
             assertEquals(malformedPayload, deadLetter.value());
         }
 
@@ -145,6 +144,7 @@ class PaymentEventFlowIntegrationTest {
         assertEquals(DeadLetterStatus.PENDING, indexed.getStatus());
         assertEquals(PAYMENT_CREATED_TOPIC, indexed.getSourceTopic());
         assertEquals(PAYMENT_CREATED_DLT, indexed.getDltTopic());
+        assertTrue(indexed.getFailureMessage() != null && !indexed.getFailureMessage().isBlank());
     }
 
     @Test
@@ -252,15 +252,18 @@ class PaymentEventFlowIntegrationTest {
         return new KafkaConsumer<>(properties);
     }
 
-    private ConsumerRecord<String, String> awaitRecord(KafkaConsumer<String, String> consumer,
-                                                        Duration timeout) {
+    private ConsumerRecord<String, String> awaitRecordWithKey(KafkaConsumer<String, String> consumer,
+                                                               String expectedKey,
+                                                               Duration timeout) {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (System.nanoTime() < deadline) {
             for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofMillis(500))) {
-                return record;
+                if (expectedKey.equals(record.key())) {
+                    return record;
+                }
             }
         }
-        throw new AssertionError("Timed out waiting for record on " + PAYMENT_CREATED_DLT);
+        throw new AssertionError("Timed out waiting for matching record on " + PAYMENT_CREATED_DLT);
     }
 
     private void awaitTrue(BooleanSupplier condition, Duration timeout) throws InterruptedException {
