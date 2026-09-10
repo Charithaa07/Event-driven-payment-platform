@@ -27,7 +27,7 @@ spec:
         {{- include "payment-platform.labels" $ | nindent 8 }}
         app.kubernetes.io/component: {{ $name }}
     spec:
-      serviceAccountName: {{ include "payment-platform.serviceAccountName" $ }}
+      serviceAccountName: {{ include "payment-platform.serviceAccountName" (dict "root" $ "name" $name) }}
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
       securityContext:

@@ -1,8 +1,8 @@
 # Event-Driven Payment Platform
 
-A portfolio-grade payment backend built to demonstrate production concerns beyond CRUD: **authenticated APIs, concurrency-safe idempotency, transactional messaging, at-least-once delivery, consumer deduplication, bounded recovery, operational replay, immutable audit evidence, asynchronous provider delivery, observability, container hardening, and Kubernetes deployment**.
+A portfolio-grade payment backend built to demonstrate production concerns beyond CRUD: **authenticated APIs, concurrency-safe idempotency, transactional messaging, at-least-once delivery, consumer deduplication, bounded recovery, operational replay, immutable audit evidence, asynchronous provider delivery, observability, container hardening, Kubernetes deployment, and AWS infrastructure as code**.
 
-> Status: **Phase 13** — Payment, Transaction, Audit, and Notification run as independent Spring Boot services with separate datastores. The platform now includes a reusable hardened JVM image contract and a Helm chart with health probes, rolling updates, autoscaling, disruption budgets, secret/config boundaries, and optional ingress.
+> Status: **Phase 14** — Payment, Transaction, Audit, and Notification run as independent Spring Boot services with separate datastores. The repository now includes hardened containers, Kubernetes/Helm packaging, a validated AWS Terraform reference architecture, EKS Pod Identity workload roles, managed RDS/MSK/ElastiCache mappings, and an opt-in GitHub OIDC deployment workflow. No AWS infrastructure is created automatically by CI.
 
 ## Architecture
 
@@ -40,25 +40,36 @@ flowchart LR
     OBS --> G[Grafana]
 ```
 
-### Kubernetes runtime
+### AWS production mapping
 
 ```text
-Ingress (optional)
-      |
-      +--> payment Service ------> Payment Deployment ------> Payment DB / Redis
-      +--> transaction Service --> Transaction Deployment --> Transaction DB
-      +--> audit Service --------> Audit Deployment --------> Audit DB
-      `--> notification Service -> Notification Deployment -> Notification DB
+GitHub Actions
+     |
+     | OIDC -> short-lived deploy role
+     v
+Amazon ECR
+     |
+     | immutable images
+     v
+Amazon EKS (private app subnets)
+     |
+     +--> Payment Service ------> RDS PostgreSQL (payments)
+     |       |                   ElastiCache Serverless Redis
+     |       `-----------------> MSK Serverless (IAM)
+     |
+     +--> Transaction Service --> RDS PostgreSQL (transactions)
+     |       `-----------------> MSK Serverless (IAM)
+     |
+     +--> Audit Service --------> RDS PostgreSQL (audit)
+     |       `-----------------> MSK Serverless (IAM)
+     |
+     `--> Notification Service -> RDS PostgreSQL (notifications)
+             `-----------------> MSK Serverless (IAM)
 
-All application Deployments
-      |
-      +--> Kafka
-      +--> OAuth2/OIDC JWKS
-      `--> OTLP collector
-
-Helm owns application compute and runtime configuration.
-PostgreSQL, Kafka, Redis, identity, and telemetry backends stay external/replaceable.
+Each workload ServiceAccount -> EKS Pod Identity -> dedicated IAM role
 ```
+
+Terraform owns the AWS reference infrastructure. Helm owns application workloads and runtime configuration. Stateful application dependencies remain managed AWS services rather than being installed inside EKS.
 
 ## Engineering highlights
 
@@ -79,7 +90,10 @@ PostgreSQL, Kafka, Redis, identity, and telemetry backends stay external/replace
 - Testcontainers verification with real PostgreSQL, Redis, and Kafka
 - Reusable non-root JVM Docker image with memory-aware JVM settings
 - **Helm-managed Kubernetes Deployments, Services, HPAs, PDBs, ConfigMap/Secret boundaries, probes, rolling updates, and optional Ingress**
-- GitHub Actions validates infrastructure configuration, Helm rendering, the Maven reactor, and all four runtime images
+- **Terraform-managed AWS reference architecture** spanning two AZs with EKS, ECR, four RDS PostgreSQL datastores, MSK Serverless, ElastiCache Serverless Redis, IAM, and CloudWatch control-plane logs
+- **EKS Pod Identity** gives each workload a distinct IAM role for MSK instead of static cloud credentials
+- **GitHub Actions OIDC** provides short-lived deployment credentials and an immutable ECR -> Helm -> EKS release path
+- CI validates observability configuration, Terraform formatting/provider schemas, generic + AWS Helm rendering, the Maven reactor, and all four runtime images
 
 ## Core payment flow
 
@@ -132,8 +146,8 @@ FOR UPDATE SKIP LOCKED claim
         |
         v
 Provider call outside DB transaction
-   | success            -> SENT
-   | retryable failure  -> RETRY_PENDING + backoff
+   | success             -> SENT
+   | retryable failure   -> RETRY_PENDING + backoff
    ` permanent/exhausted -> FAILED
 ```
 
@@ -163,6 +177,8 @@ Logical JWT audiences are independently configurable: `payment-api`, `transactio
 All four services expose Micrometer telemetry and can export traces over OTLP. Domain metrics include payment outbox publication, transaction processing/DLT recovery, audit ingestion, and notification ingestion/delivery attempts.
 
 The local observability profile provisions Prometheus, Grafana, and Tempo. Shared environments should keep `/actuator/prometheus` protected and provide authenticated scraping instead of enabling the local unauthenticated switch.
+
+The AWS values profile points OTLP traffic at an in-cluster ADOT/OpenTelemetry Collector service, but Phase 14 does **not** provision that collector. Install one separately or override the endpoint before enabling real AWS trace export.
 
 ## Run locally
 
@@ -203,60 +219,43 @@ export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
 
 Grafana is on `localhost:3000`, Prometheus on `localhost:9090`, and Tempo on `localhost:3200`.
 
-## Build runtime images
+## Kubernetes / Helm
 
-Build the Spring Boot jars first:
-
-```bash
-mvn --batch-mode -DskipTests package
-```
-
-The root `Dockerfile` is intentionally shared by all four services. Each image receives exactly one packaged jar and runs as UID/GID `10001` on the JRE runtime image.
-
-```bash
-docker build --build-arg JAR_FILE=payment-service/target/payment-service-0.1.0-SNAPSHOT.jar --build-arg SERVICE_PORT=8080 -t ghcr.io/charithaa07/payment-service:0.13.0 .
-```
-
-Use the equivalent service jar/port for Transaction (`8081`), Audit (`8082`), and Notification (`8083`). CI builds all four images from the packaged reactor.
-
-## Deploy with Helm
-
-The chart is in `deploy/helm/payment-platform`. It deploys application workloads only; database, Kafka, Redis, OIDC, and OTLP endpoints are injected through values so they can later map to managed AWS services.
+The chart is in `deploy/helm/payment-platform`. It deploys application workloads only. Database, Kafka, Redis, OIDC, and OTLP endpoints are injected through values.
 
 ```bash
 helm lint deploy/helm/payment-platform
 helm template payment-platform deploy/helm/payment-platform --namespace payments
 ```
 
-Database usernames/passwords are read from the pre-existing `payment-platform-secrets` Kubernetes Secret. No real credentials or secret values are committed to the repository.
+The chart supports dedicated ServiceAccounts for all four workloads, hardened pod security, HPA/PDB, health probes, graceful rolling updates, and an optional Ingress. See [`docs/kubernetes.md`](docs/kubernetes.md).
 
-A production install should override dependency endpoints and use immutable image tags or digests:
+## AWS infrastructure and delivery
+
+Terraform is under `deploy/aws/terraform`. Normal CI performs formatting and provider-schema validation **without AWS credentials and without creating resources**.
 
 ```bash
-helm upgrade --install payment-platform deploy/helm/payment-platform \
-  --namespace payments \
-  --create-namespace \
-  --set-string global.kafkaBootstrapServers='kafka.example.internal:9092' \
-  --set-string global.redisHost='redis.example.internal' \
-  --set-string services.payment.image.tag='0.13.0'
+terraform -chdir=deploy/aws/terraform fmt -check -diff -recursive
+terraform -chdir=deploy/aws/terraform init -backend=false -input=false
+terraform -chdir=deploy/aws/terraform validate
 ```
 
-See [`docs/kubernetes.md`](docs/kubernetes.md) for the deployment model, secret contract, image commands, external dependency overrides, and scaling notes.
+The AWS reference maps the platform to:
 
-### Kubernetes reliability/security model
+```text
+Compute       Amazon EKS + managed node group
+Images        Amazon ECR, immutable tags
+Messaging     Amazon MSK Serverless + IAM/SASL
+Databases     four Amazon RDS for PostgreSQL instances
+Cache         ElastiCache Serverless for Redis
+Identity      EKS Pod Identity per workload
+CI/CD auth    GitHub Actions OIDC -> short-lived AWS role
+Logs          EKS control-plane logs -> CloudWatch
+```
 
-- rolling updates use `maxUnavailable: 0` and `maxSurge: 1`
-- Spring Boot startup/readiness/liveness probes are enabled explicitly
-- graceful shutdown receives a 30-second pod termination window
-- HPA uses `autoscaling/v2` with CPU requests as its utilization denominator
-- PodDisruptionBudgets retain at least one replica during voluntary disruption
-- topology spread reduces unnecessary same-node concentration
-- containers run non-root with `allowPrivilegeEscalation: false`, `RuntimeDefault` seccomp, dropped capabilities, and a read-only root filesystem
-- `/tmp` is an `emptyDir`, preserving JVM compatibility without making the image filesystem writable
-- service-account tokens are not mounted because the applications do not call the Kubernetes API
-- non-secret settings live in a ConfigMap; database credentials come from an externally managed Secret
+The deployment workflow `.github/workflows/aws-deploy.yml` is **manual (`workflow_dispatch`) only** and restricted to the `production` GitHub Environment. It builds/pushes commit-tagged ECR images, discovers managed endpoints, materializes RDS-managed credentials from Secrets Manager into the existing Kubernetes Secret contract, and deploys with Helm `--atomic` before checking all four rollouts.
 
-Kubernetes scaling does not change messaging correctness: outbox delivery remains at least once, consumers remain database-idempotent, and Kafka partitions/provider quotas remain independent limits on effective parallelism.
+A real AWS apply/deploy requires an AWS account and creates billable resources. This repository does not automatically run `terraform apply` or deploy to AWS on merge. See [`docs/aws.md`](docs/aws.md) for the architecture, prerequisites, identity boundaries, state backend guidance, deployment variables, and operational notes.
 
 ## Verification
 
@@ -268,7 +267,7 @@ Kubernetes scaling does not change messaging correctness: outbox delivery remain
 
 **Notification Service:** Kafka + PostgreSQL tests verify logical duplicate events create one delivery, retryable failure persists `RETRY_PENDING` and later reaches `SENT`, permanent failure reaches `FAILED`, malformed records reach the notification DLT, APIs enforce `notification:read`, and OpenAPI remains public.
 
-**Deployment:** CI runs `helm lint`, renders the chart and asserts four Deployments/Services/HPAs/PDBs, packages the Maven reactor, and builds all four service runtime images.
+**Infrastructure:** CI validates the observability profile, Terraform formatting/provider schemas, generic Helm output, the AWS MSK-IAM/Redis-TLS Helm profile, four dedicated ServiceAccounts, the complete Maven reactor, and all four hardened service images.
 
 ## Roadmap
 
@@ -283,22 +282,23 @@ Kubernetes scaling does not change messaging correctness: outbox delivery remain
 - [x] Immutable Audit Service + dedicated datastore
 - [x] Notification Service + leased retryable provider dispatch
 - [x] PostgreSQL / Redis / Kafka Testcontainers verification
-- [x] GitHub Actions CI
-- [x] **Containerized service runtime + Kubernetes/Helm deployment**
+- [x] Containerized service runtime + Kubernetes/Helm deployment
+- [x] **AWS Terraform reference architecture + OIDC/ECR/EKS delivery pipeline**
 - [ ] Expand audit ingestion to transaction/notification lifecycle topics
 - [ ] Real provider adapter with secret-managed credentials
-- [ ] **AWS deployment architecture and cloud delivery pipeline**
+- [ ] AWS observability hardening: ADOT/managed Prometheus/alerts
+- [ ] Load/performance testing and capacity report
 
 ## Tech stack
 
 **Backend:** Java 17, Spring Boot, Spring Data JPA, Spring Data Redis, Spring Kafka  
 **API:** REST, OpenAPI, springdoc, Swagger UI  
-**Security:** Spring Security, OAuth2 Resource Server, JWT, JWKS, scopes  
-**Data:** PostgreSQL, Redis  
-**Messaging:** Apache Kafka  
-**Observability:** Micrometer, Prometheus, OpenTelemetry, OTLP, Tempo, Grafana, Spring Boot Actuator  
+**Security:** Spring Security, OAuth2 Resource Server, JWT, JWKS, scopes, AWS IAM, EKS Pod Identity, GitHub OIDC  
+**Data:** PostgreSQL, Redis, Amazon RDS, ElastiCache Serverless  
+**Messaging:** Apache Kafka, Amazon MSK Serverless, AWS MSK IAM auth  
+**Observability:** Micrometer, Prometheus, OpenTelemetry, OTLP, Tempo, Grafana, Spring Boot Actuator, CloudWatch control-plane logs  
 **Testing:** JUnit, Spring Security Test, Testcontainers  
-**Infrastructure:** Docker, Docker Compose, Kubernetes, Helm, HPA, PodDisruptionBudget, ConfigMap/Secret, GitHub Actions
+**Infrastructure:** Docker, Docker Compose, Kubernetes, Helm, Terraform, Amazon EKS, ECR, RDS, MSK, ElastiCache, IAM, Secrets Manager, GitHub Actions
 
 ## Repository structure
 
@@ -309,17 +309,28 @@ event-driven-payment-platform/
 ├── audit-service/
 ├── notification-service/
 ├── deploy/
-│   └── helm/payment-platform/
-│       ├── Chart.yaml
-│       ├── values.yaml
-│       └── templates/
+│   ├── helm/payment-platform/
+│   │   ├── Chart.yaml
+│   │   ├── values.yaml
+│   │   ├── values-aws.yaml
+│   │   └── templates/
+│   └── aws/terraform/
+│       ├── networking.tf
+│       ├── platform.tf
+│       ├── iam.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       └── versions.tf
 ├── observability/
 ├── docs/
 │   ├── architecture.md
-│   └── kubernetes.md
+│   ├── kubernetes.md
+│   └── aws.md
 ├── Dockerfile
 ├── .dockerignore
-├── .github/workflows/ci.yml
+├── .github/workflows/
+│   ├── ci.yml
+│   └── aws-deploy.yml
 ├── docker-compose.yml
 ├── pom.xml
 └── README.md
@@ -327,4 +338,4 @@ event-driven-payment-platform/
 
 ## Design principle
 
-Each milestone introduces a concrete production concern and documents the trade-off it solves. The repository evolves through reviewable PRs so its history demonstrates service boundaries, failure modes, correctness invariants, deployment boundaries, and executable verification rather than a one-shot code dump.
+Each milestone introduces a concrete production concern and documents the trade-off it solves. The repository evolves through reviewable PRs so its history demonstrates service boundaries, failure modes, correctness invariants, deployment boundaries, cloud identity, and executable verification rather than a one-shot code dump.

@@ -1,0 +1,29 @@
+project_name = "payment-platform"
+environment  = "prod"
+aws_region   = "us-west-2"
+
+# Use the newest EKS version your organization has qualified.
+kubernetes_version = "1.36"
+
+# A GitHub-hosted deployment runner needs public control-plane access.
+# Production teams should tighten this or use a private/self-hosted runner.
+eks_public_access_cidrs = ["0.0.0.0/0"]
+
+node_instance_types = ["t3.large"]
+node_min_size       = 2
+node_desired_size   = 2
+node_max_size       = 6
+
+rds_instance_class      = "db.t4g.micro"
+rds_multi_az            = true
+rds_deletion_protection = true
+rds_skip_final_snapshot = false
+
+github_repository = "Charithaa07/Event-driven-payment-platform"
+github_environment = "production"
+
+# Set false if token.actions.githubusercontent.com is already registered in IAM.
+create_github_oidc_provider       = true
+existing_github_oidc_provider_arn = ""
+
+kubernetes_namespace = "payments"

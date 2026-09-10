@@ -4,13 +4,16 @@ imagePullSecrets: []
 
 serviceAccount:
   create: true
+  perService: true
   name: ""
 
 global:
   environment: kubernetes
   kafkaBootstrapServers: kafka:9092
+  kafkaIamAuthEnabled: false
   redisHost: redis
   redisPort: 6379
+  redisSslEnabled: false
   jwtIssuerUri: https://auth.example.com/
   jwtJwkSetUri: https://auth.example.com/.well-known/jwks.json
   tracingSamplingProbability: "0.10"
@@ -20,7 +23,7 @@ global:
 
 secrets:
   # The chart never creates database credentials. Create this Secret out of band
-  # (or replace it with an ExternalSecret/Secrets Store CSI integration).
+  # (or synchronize it from a cloud secret manager).
   existingSecret: payment-platform-secrets
 
 podDisruptionBudget:
