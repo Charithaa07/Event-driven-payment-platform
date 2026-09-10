@@ -1,5 +1,6 @@
 package com.charitha.transactions.messaging;
 
+import com.charitha.transactions.observability.TransactionConsumerMetrics;
 import com.charitha.transactions.service.TransactionProcessor;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
@@ -10,16 +11,30 @@ import tools.jackson.databind.json.JsonMapper;
 public class PaymentCreatedConsumer {
     private final TransactionProcessor transactionProcessor;
     private final JsonMapper jsonMapper;
+    private final TransactionConsumerMetrics metrics;
 
-    public PaymentCreatedConsumer(TransactionProcessor transactionProcessor, JsonMapper jsonMapper) {
+    public PaymentCreatedConsumer(TransactionProcessor transactionProcessor,
+                                  JsonMapper jsonMapper,
+                                  TransactionConsumerMetrics metrics) {
         this.transactionProcessor = transactionProcessor;
         this.jsonMapper = jsonMapper;
+        this.metrics = metrics;
     }
 
     @KafkaListener(topics = "${topics.payment-created}")
     public void consume(String payload) {
-        PaymentCreatedEvent event = deserialize(payload);
-        transactionProcessor.process(event);
+        metrics.recordReceived();
+        PaymentCreatedEvent event;
+        try {
+            event = deserialize(payload);
+        } catch (IllegalArgumentException ex) {
+            metrics.recordMalformed();
+            throw ex;
+        }
+
+        long startedAt = System.nanoTime();
+        boolean transactionCreated = transactionProcessor.process(event);
+        metrics.recordProcessed(transactionCreated, System.nanoTime() - startedAt);
     }
 
     private PaymentCreatedEvent deserialize(String payload) {
