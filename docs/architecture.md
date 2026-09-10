@@ -1,23 +1,18 @@
 # Architecture Notes
 
-## Phase 10 system flow
+## Phase 11 system flow
 
-1. A client obtains an access token from an external OAuth2/OIDC provider.
-2. Payment Service validates JWT signature, issuer, audience, timing, subject, and OAuth scopes.
-3. JWT `sub` is the trusted customer identity; payment reads and idempotency are scoped to that customer.
-4. Redis provides the idempotency fast path while PostgreSQL remains authoritative.
-5. A new payment and its `payments.created.v1` outbox event commit atomically.
-6. The outbox relay claims work with `FOR UPDATE SKIP LOCKED`, releases the DB transaction, then publishes to Kafka.
-7. Transaction Service consumes the event and commits the business transaction plus `processed_events` marker atomically.
-8. Retryable Kafka failures receive two retries; exhausted or malformed events go to `payments.created.v1.DLT`.
-9. A dedicated DLT indexer persists each dead-letter Kafka position, failure diagnostics, payload, and recovery state in Transaction Service PostgreSQL.
-10. Transaction Service also acts as an OAuth2 resource server for the operational recovery API: `ops:read` inspects DLT state and `ops:write` authorizes replay.
-11. Replay uses an atomic `REPLAYING` claim with a stale-claim lease, publishes outside the DB transaction, and records the authenticated operator plus outcome.
-12. springdoc generates the Payment Service OpenAPI contract and Swagger UI from runtime API metadata.
-13. Micrometer exposes framework, domain, and DLT recovery metrics through Prometheus endpoints.
-14. OpenTelemetry exports sampled traces over OTLP when tracing export is enabled.
-15. Kafka producer/listener observation is enabled so normal Kafka records can carry tracing context.
-16. Prometheus, Tempo, and Grafana form the local observability plane.
+1. Payment Service authenticates customer requests, applies customer-scoped idempotency, and commits a payment plus `payments.created.v1` outbox row atomically.
+2. The outbox relay claims rows with `FOR UPDATE SKIP LOCKED`, commits the claim, then publishes outside the database transaction.
+3. Kafka fan-out is implemented with independent consumer groups: Transaction Service updates business state while Audit Service records immutable evidence.
+4. Transaction Service atomically writes its transaction plus durable `processed_events` deduplication state.
+5. Transaction failures receive bounded retries and then move to `payments.created.v1.DLT`; DLT records are indexed for secured operational replay.
+6. Audit Service independently consumes `payments.created.v1`, validates the event contract, computes a SHA-256 record digest, and inserts one append-only audit row.
+7. Audit ingestion is idempotent by both logical `event_id` and Kafka `(topic, partition, offset)`.
+8. PostgreSQL enforces Audit Service immutability with a trigger that rejects `UPDATE` and `DELETE` on `audit_events`.
+9. Audit query endpoints expose payment timelines and detailed evidence only to tokens carrying `audit:read`.
+10. Malformed/unrecoverable audit ingestion is isolated to `payments.created.v1.audit.DLT` instead of blocking the primary consumer indefinitely.
+11. Payment, Transaction, and Audit services expose Micrometer telemetry and can export OpenTelemetry traces over OTLP.
 
 ## Runtime architecture
 
@@ -25,192 +20,213 @@
 OAuth2/OIDC Provider
         |
         | JWKS
-        +-------------------+
-        v                   v
-Client -> Payment Service   Transaction Service <--- Operator
-              |                  |     ^              ops:read/write
-              +-> Redis          |     |
-              +-> Payment DB     |     +--- DLT recovery API
-                     |           |
-                     `-> Outbox  +-> Transaction DB
-                          |       |      +-- processed_events
-                   SKIP LOCKED    |      `-- dead_letter_events
-                          |       |
-                          v       |
-                     Outbox Relay |
-                          |       |
-                          v       |
-                        Kafka ----+
-                          |
-                          +--> payments.created.v1.DLT
-                                      |
-                                      v
-                                  DLT Indexer
+        +----------------+----------------+
+        v                v                v
+Payment Service   Transaction Service   Audit Service
+     |                    |                |
+     +-> Redis            +-> Tx DB        +-> Audit DB
+     +-> Payment DB       |   + processed  |   append-only
+            |             |   + DLT index  |   SHA-256 digest
+            v             |                |
+          Outbox          |                |
+            |             |                |
+       Outbox Relay       |                |
+            |             |                |
+            +----------> Kafka <-----------+
+                           |
+             +-------------+-------------+
+             |                           |
+             v                           v
+      payments.created.v1        payments.created.v1.DLT
+             |                           |
+             +--> Audit group            +--> DLT indexer/replay
+             `--> Transaction group
 
-Payment Service ------ Prometheus scrape ------+
-Transaction Service -- Prometheus scrape ------+--> Grafana
-Payment Service ------ OTLP traces ------------+--> Tempo --> Grafana
-Transaction Service -- OTLP traces ------------+
+All services ---- Prometheus / OTLP ----> Grafana + Tempo
 ```
 
-## Security boundary
+Kafka consumer groups are intentionally separate. Transaction Service availability does not gate audit persistence, and Audit Service availability does not gate business-state processing. Each service owns its own database and never reads another service's tables.
 
-Both HTTP-facing services are stateless OAuth2 resource servers. Neither issues credentials.
+## Payment correctness boundary
 
-Payment Service scopes:
+```text
+JWT sub + Idempotency-Key
+        |
+        v
+Redis fast path
+  |-- hit --> original response / 409 on semantic conflict
+  `-- miss/failure
+        |
+        v
+PostgreSQL (customer_id, idempotency_key)
+        |
+INSERT ... ON CONFLICT DO NOTHING
+        |
+new payment + outbox row in one transaction
+```
+
+PostgreSQL remains authoritative. Redis is an optimization. The outbox is the durable boundary between the payment database transaction and Kafka.
+
+## Transaction processing and DLT recovery
+
+Transaction Service consumes `payments.created.v1` with at-least-once semantics. New events create a business transaction and `processed_events` marker in one database transaction; duplicate event IDs become no-ops.
+
+Retryable processing failures receive two retries. Exhausted or deterministic malformed records are routed to `payments.created.v1.DLT`. A dedicated indexer stores DLT Kafka position, original-record metadata, failure diagnostics, payload, and recovery state.
+
+Operational replay uses:
+
+```text
+PENDING / FAILED
+      |
+      v
+atomic REPLAYING claim + operator identity
+      |
+      v
+commit DB claim
+      |
+      v
+Kafka publish outside DB transaction
+  |-- success --> REPLAYED
+  `-- failure --> FAILED + last_replay_error
+```
+
+A stale `REPLAYING` claim can be reclaimed after 30 seconds. Replay remains at-least-once because a process can die after broker acknowledgement and before the final state update. Durable Transaction Service idempotency protects the business effect.
+
+## Audit Service correctness model
+
+Audit Service is not another projection of mutable business state. Its responsibility is to preserve evidence of events observed on the integration boundary.
+
+### Append-only schema
+
+Each `audit_events` row stores:
+
+- immutable `event_id` primary key;
+- event and aggregate type;
+- payment aggregate ID and customer ID;
+- Kafka source topic, partition, and offset;
+- original JSON payload;
+- event occurrence timestamp and audit recording timestamp;
+- a 64-character SHA-256 record digest.
+
+The database also enforces a unique `(source_topic, source_partition, source_offset)` constraint.
+
+A PostgreSQL `BEFORE UPDATE OR DELETE` trigger raises an exception for every attempted mutation. Immutability is therefore enforced below the REST/service layer; accidental repository or SQL updates cannot silently rewrite audit history.
+
+### Idempotent ingestion
+
+```text
+Kafka record
+   |
+   v
+parse + validate PaymentCreatedEvent
+   |
+   v
+compute SHA-256 over:
+ event_id
+ event_type
+ aggregate_id
+ customer_id
+ source topic/partition/offset
+ original payload
+   |
+   v
+INSERT audit_events ... ON CONFLICT DO NOTHING
+```
+
+Two forms of duplicate are covered:
+
+1. the same Kafka record is redelivered at the same source position;
+2. the same logical `event_id` appears again at another offset, for example after a replay.
+
+Both resolve to one immutable audit event. This is intentional: the table represents logical event evidence, not every broker delivery attempt.
+
+### Integrity verification
+
+`GET /api/v1/audit/events/{eventId}` recomputes the SHA-256 digest from stored immutable metadata and payload and returns `integrityValid`. The digest is evidence for accidental or unauthorized content changes; it is not presented as a substitute for cryptographic signing, external timestamping, or a blockchain/ledger system.
+
+### Audit API exposure
+
+```text
+audit:read
+   |
+   +--> GET /api/v1/audit/payments/{paymentId}
+   |       timeline metadata; raw payload omitted
+   |
+   `--> GET /api/v1/audit/events/{eventId}
+           full raw payload + integrity result
+```
+
+The Audit Service is a stateless OAuth2 resource server with a logical audience of `audit-api`. Health/info and OpenAPI surfaces remain public; metrics are protected by `ops:read` unless the explicit local Prometheus development switch is enabled.
+
+### Audit failure isolation
+
+A malformed event is a deterministic failure and is not retried pointlessly. Other ingestion failures receive bounded retry. Unrecoverable records are published to:
+
+```text
+payments.created.v1.audit.DLT
+```
+
+This DLT is separate from Transaction Service's DLT because the two consumers have different responsibilities and failure modes.
+
+## Security boundaries
+
+Payment Service:
 
 ```text
 payments:write -> POST /api/v1/payments
 payments:read  -> GET /api/v1/payments/{id}
-ops:read       -> metrics / Prometheus by default
+ops:read       -> metrics / Prometheus
 ```
 
-Transaction Service operational scopes:
+Transaction Service:
 
 ```text
-ops:read  -> GET  /api/v1/operations/dlt[/{id}]
-ops:write -> POST /api/v1/operations/dlt/{id}/replay
-ops:read  -> metrics / Prometheus by default
+ops:read  -> inspect DLT recovery state
+ops:write -> replay DLT record
+ops:read  -> metrics / Prometheus
 ```
 
-`/actuator/health` and `/actuator/info` remain public. `/actuator/prometheus` is protected by `ops:read` unless the explicit local-development setting `OBSERVABILITY_PUBLIC_PROMETHEUS=true` is enabled. That switch exists only for the local unauthenticated Prometheus container.
-
-## Customer-scoped idempotency
+Audit Service:
 
 ```text
-JWT sub = customer-A
-Idempotency-Key = checkout-42
-        |
-        v
-Redis hashed customer/key namespace
-  |-- hit --> compare original request --> return / 409
-  `-- miss
-       |
-       v
-PostgreSQL WHERE customer_id = customer-A
-              AND idempotency_key = checkout-42
-       |-- existing --> compare --> return / 409
-       `-- absent
-            |
-            v
-INSERT ... ON CONFLICT (customer_id, idempotency_key) DO NOTHING
+audit:read -> payment audit timeline + event detail
+ops:read   -> metrics / Prometheus
 ```
 
-Two customers may use the same textual idempotency key independently. For one customer, reusing a key with a different amount or currency returns `409 Conflict`.
-
-## Transactional outbox
-
-```text
-payment transaction
-  +-- payment row
-  `-- PENDING outbox row
-          |
-          v
-claim transaction
-  SELECT claimable rows
-  FOR UPDATE SKIP LOCKED
-  mark PROCESSING + claimed_at
-COMMIT
-          |
-          v
-Kafka I/O outside DB lock
-  |-- success --> PUBLISHED
-  `-- failure --> bounded backoff --> FAILED after max attempts
-```
-
-The relay is intentionally **at least once**. A crash after Kafka acknowledges a send but before PostgreSQL records `PUBLISHED` can produce redelivery, so Transaction Service deduplicates using the immutable event ID and durable `processed_events` state.
-
-## Consumer recovery and DLT indexing
-
-```text
-payments.created.v1
-        |
-        v
-Transaction Service
-  |-- new event ------> transaction + processed_events
-  |-- duplicate -----> no duplicate business write
-  |-- retryable -----> retry 1 -> retry 2 -> DLT
-  `-- malformed -----> DLT without useless retries
-                                      |
-                                      v
-                                DLT indexer
-                                      |
-                                      v
-                              dead_letter_events
-```
-
-Each DLT record is uniquely indexed by `(dlt_topic, dlt_partition, dlt_offset)`, so indexer redelivery does not create duplicate recovery records. Spring Kafka DLT headers provide original topic/partition/offset/consumer-group and exception metadata when available.
-
-## Operational replay state machine
-
-```text
-PENDING ------> REPLAYING ------> REPLAYED
-   ^                |
-   |                |
-   +----- FAILED <--+
-```
-
-Replay does not hold a database lock while waiting for Kafka. The workflow is:
-
-1. atomically claim `PENDING`, `FAILED`, or stale `REPLAYING` state;
-2. record `replay_attempts`, `replay_claimed_at`, and the operator JWT subject;
-3. commit the claim;
-4. publish the original key/payload to the original source topic;
-5. mark `REPLAYED` after broker acknowledgement, or `FAILED` with `last_replay_error` on failure.
-
-A `REPLAYING` claim older than 30 seconds may be reclaimed after an instance crash. Two live operators cannot intentionally claim the same record at the same time.
-
-Replay remains **at least once**. A crash after Kafka acknowledgement but before the `REPLAYED` update can lead to a later duplicate replay. The durable `processed_events` consumer guard makes the duplicate business effect safe.
-
-The recovery API intentionally does not support editing a financial event payload before replay. A poison record should be replayed only after the underlying producer/data/application issue is corrected; payload mutation would require a separate audited correction workflow.
-
-See [`dlt-recovery.md`](dlt-recovery.md) for the operational runbook.
-
-## API contract boundary
-
-springdoc derives the Payment Service OpenAPI document from controller metadata, validation constraints, schemas, and explicit operation annotations. The contract documents bearer authentication, scopes, `Idempotency-Key`, ownership semantics, examples, and the `400 / 401 / 403 / 404 / 409` response model. Integration tests inspect `/v3/api-docs` to catch contract drift.
+All three services verify JWT signatures from configured JWKS and validate issuer, audience, timing, and a non-empty subject.
 
 ## Observability plane
 
-Payment Service domain metrics:
+Payment Service domain metrics include outbox backlog, Kafka publish outcomes, and publish latency. Transaction Service metrics include event outcomes, processing latency, DLT indexing/backlog, and replay outcomes. Audit Service adds:
 
-- `payments.outbox.events` with `status=pending|processing|failed`
-- `payments.outbox.publish.events` with `outcome=success|failure`
-- `payments.outbox.publish.latency`
+```text
+audit.payment.events{outcome=received|stored|duplicate|malformed|dead_lettered}
+```
 
-Transaction Service domain/recovery metrics:
+Prometheus scrapes service ports `8080`, `8081`, and `8082`. OpenTelemetry export remains opt-in. Kafka observation can propagate tracing context from the outbox relay to downstream consumers.
 
-- `transactions.payment.events` with `outcome=received|created|duplicate|malformed`
-- `transactions.payment.processing.latency` with `outcome=created|duplicate`
-- `transactions.kafka.dlt`
-- `transactions.kafka.dlt.indexed`
-- `transactions.kafka.dlt.backlog`
-- `transactions.kafka.dlt.replay` with `outcome=success|failure`
+### Important outbox trace boundary
 
-Framework telemetry includes HTTP server metrics, JVM/runtime metrics, datasource instrumentation, and Kafka observations. Histograms are enabled for latency series used in dashboard queries.
+The outbox stores the business payload but not the original HTTP W3C trace context. The payment HTTP trace therefore ends before the scheduled relay begins. Downstream Kafka consumer traces can be linked to the relay-produced record, but the system does not claim a continuous HTTP-to-consumer trace that it does not actually persist.
 
-## Important outbox trace boundary
+## Container-backed verification
 
-The transactional outbox stores the business event payload but **does not persist the original HTTP trace context**. The original payment request therefore commits before a later scheduled relay starts publishing the outbox event. Kafka observation can propagate context from the relay-produced record to Transaction Service, but that relay trace should not be presented as a continuous child of the earlier HTTP request.
+CI runs the entire Maven reactor plus infrastructure configuration validation.
 
-Persisting W3C trace context alongside the outbox record would be a separate future design choice.
+Audit Service's real Kafka + PostgreSQL suite verifies:
 
-## Verification
+- duplicate logical delivery creates one audit row;
+- the persisted digest recomputes successfully;
+- PostgreSQL itself rejects an attempted `UPDATE`;
+- malformed JSON reaches `payments.created.v1.audit.DLT`;
+- unauthenticated audit queries return `401`;
+- tokens without `audit:read` return `403`;
+- timeline responses omit raw payload;
+- detail responses expose payload and a successful integrity verification;
+- the generated OpenAPI contract is public and documents the Audit API.
 
-CI validates the Compose/Grafana configuration and runs the complete Maven/Testcontainers reactor.
+Existing Payment and Transaction Service Testcontainers suites continue to verify payment idempotency/outbox behavior and transaction/DLT recovery behavior respectively.
 
-Payment Service integration coverage includes PostgreSQL/Redis idempotency, rollback behavior, customer isolation, outbox claiming, OAuth2 authorization, OpenAPI, and protected Prometheus metrics.
+## Future expansion
 
-Transaction Service integration coverage now verifies:
-
-- duplicate source events create one business transaction;
-- malformed source events reach the DLT;
-- DLT records are durably indexed with failure metadata;
-- a valid DLT record can be replayed into the original source topic and processed;
-- a `REPLAYED` record is idempotent on repeated replay requests;
-- DLT inspection requires `ops:read`;
-- replay requires `ops:write`.
-
-## Remaining platform work
-
-The next high-value milestones are service expansion (notification/audit), Kubernetes/Helm deployment definitions, and an AWS deployment architecture.
+Phase 11 intentionally records `PAYMENT_CREATED_V1`. The same Audit Service model can ingest additional independently versioned lifecycle topics later (for example transaction-state or notification outcomes) while retaining the same append-only and integrity rules.
