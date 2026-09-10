@@ -2,7 +2,6 @@ package com.charitha.transactions.messaging;
 
 import com.charitha.transactions.service.TransactionProcessor;
 import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
@@ -18,10 +17,9 @@ public class PaymentCreatedConsumer {
     }
 
     @KafkaListener(topics = "${topics.payment-created}")
-    public void consume(String payload, Acknowledgment acknowledgment) {
+    public void consume(String payload) {
         PaymentCreatedEvent event = deserialize(payload);
         transactionProcessor.process(event);
-        acknowledgment.acknowledge();
     }
 
     private PaymentCreatedEvent deserialize(String payload) {
