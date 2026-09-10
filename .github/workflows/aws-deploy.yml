@@ -1,0 +1,216 @@
+name: Deploy to AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Optional immutable image tag; defaults to the selected main commit SHA
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: aws-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      K8S_NAMESPACE: payments
+      HELM_RELEASE: payment-platform
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-payment-platform-deploy
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Package services
+        run: mvn --batch-mode -DskipTests package
+
+      - name: Build and push immutable service images
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_SHA}"; fi
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+
+          while IFS=: read -r service port; do
+            jar_file=$(find "$service/target" -maxdepth 1 -type f -name "$service-*.jar" ! -name "*.original" | head -n 1)
+            test -n "$jar_file"
+            image="$ECR_REGISTRY/payment-platform/$service:$TAG"
+            docker build \
+              --build-arg JAR_FILE="$jar_file" \
+              --build-arg SERVICE_PORT="$port" \
+              -t "$image" .
+            docker push "$image"
+          done <<'EOF'
+          payment-service:8080
+          transaction-service:8081
+          audit-service:8082
+          notification-service:8083
+          EOF
+
+      - name: Configure kubectl for EKS
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Discover managed service endpoints
+        run: |
+          set -euo pipefail
+
+          rds_endpoint() {
+            aws rds describe-db-instances \
+              --db-instance-identifier "$EKS_CLUSTER_NAME-$1" \
+              --query 'DBInstances[0].Endpoint.Address' \
+              --output text
+          }
+
+          rds_secret() {
+            aws rds describe-db-instances \
+              --db-instance-identifier "$EKS_CLUSTER_NAME-$1" \
+              --query 'DBInstances[0].MasterUserSecret.SecretArn' \
+              --output text
+          }
+
+          PAYMENT_DB_HOST=$(rds_endpoint payment)
+          TRANSACTION_DB_HOST=$(rds_endpoint transaction)
+          AUDIT_DB_HOST=$(rds_endpoint audit)
+          NOTIFICATION_DB_HOST=$(rds_endpoint notification)
+
+          PAYMENT_DB_SECRET=$(rds_secret payment)
+          TRANSACTION_DB_SECRET=$(rds_secret transaction)
+          AUDIT_DB_SECRET=$(rds_secret audit)
+          NOTIFICATION_DB_SECRET=$(rds_secret notification)
+
+          REDIS_HOST=$(aws elasticache describe-serverless-caches \
+            --serverless-cache-name "$EKS_CLUSTER_NAME-redis" \
+            --query 'ServerlessCaches[0].Endpoint.Address' --output text)
+          REDIS_PORT=$(aws elasticache describe-serverless-caches \
+            --serverless-cache-name "$EKS_CLUSTER_NAME-redis" \
+            --query 'ServerlessCaches[0].Endpoint.Port' --output text)
+
+          MSK_ARN=$(aws kafka list-clusters-v2 \
+            --cluster-name-filter "$EKS_CLUSTER_NAME-msk" \
+            --query 'ClusterInfoList[0].ClusterArn' --output text)
+          KAFKA_BOOTSTRAP=$(aws kafka get-bootstrap-brokers \
+            --cluster-arn "$MSK_ARN" \
+            --query 'BootstrapBrokerStringSaslIam' --output text)
+
+          {
+            echo "PAYMENT_DB_HOST=$PAYMENT_DB_HOST"
+            echo "TRANSACTION_DB_HOST=$TRANSACTION_DB_HOST"
+            echo "AUDIT_DB_HOST=$AUDIT_DB_HOST"
+            echo "NOTIFICATION_DB_HOST=$NOTIFICATION_DB_HOST"
+            echo "PAYMENT_DB_SECRET=$PAYMENT_DB_SECRET"
+            echo "TRANSACTION_DB_SECRET=$TRANSACTION_DB_SECRET"
+            echo "AUDIT_DB_SECRET=$AUDIT_DB_SECRET"
+            echo "NOTIFICATION_DB_SECRET=$NOTIFICATION_DB_SECRET"
+            echo "REDIS_HOST=$REDIS_HOST"
+            echo "REDIS_PORT=$REDIS_PORT"
+            echo "KAFKA_BOOTSTRAP=$KAFKA_BOOTSTRAP"
+          } >> "$GITHUB_ENV"
+
+      - name: Materialize database credentials from Secrets Manager
+        run: |
+          set -euo pipefail
+
+          read_secret() {
+            aws secretsmanager get-secret-value \
+              --secret-id "$1" \
+              --query SecretString \
+              --output text
+          }
+
+          PAYMENT_JSON=$(read_secret "$PAYMENT_DB_SECRET")
+          TRANSACTION_JSON=$(read_secret "$TRANSACTION_DB_SECRET")
+          AUDIT_JSON=$(read_secret "$AUDIT_DB_SECRET")
+          NOTIFICATION_JSON=$(read_secret "$NOTIFICATION_DB_SECRET")
+
+          PAYMENT_USER=$(jq -r .username <<<"$PAYMENT_JSON")
+          PAYMENT_PASSWORD=$(jq -r .password <<<"$PAYMENT_JSON")
+          TRANSACTION_USER=$(jq -r .username <<<"$TRANSACTION_JSON")
+          TRANSACTION_PASSWORD=$(jq -r .password <<<"$TRANSACTION_JSON")
+          AUDIT_USER=$(jq -r .username <<<"$AUDIT_JSON")
+          AUDIT_PASSWORD=$(jq -r .password <<<"$AUDIT_JSON")
+          NOTIFICATION_USER=$(jq -r .username <<<"$NOTIFICATION_JSON")
+          NOTIFICATION_PASSWORD=$(jq -r .password <<<"$NOTIFICATION_JSON")
+
+          for value in "$PAYMENT_PASSWORD" "$TRANSACTION_PASSWORD" "$AUDIT_PASSWORD" "$NOTIFICATION_PASSWORD"; do
+            echo "::add-mask::$value"
+          done
+
+          kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n "$K8S_NAMESPACE" create secret generic payment-platform-secrets \
+            --from-literal=payment-db-user="$PAYMENT_USER" \
+            --from-literal=payment-db-password="$PAYMENT_PASSWORD" \
+            --from-literal=transaction-db-user="$TRANSACTION_USER" \
+            --from-literal=transaction-db-password="$TRANSACTION_PASSWORD" \
+            --from-literal=audit-db-user="$AUDIT_USER" \
+            --from-literal=audit-db-password="$AUDIT_PASSWORD" \
+            --from-literal=notification-db-user="$NOTIFICATION_USER" \
+            --from-literal=notification-db-password="$NOTIFICATION_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy immutable release with Helm
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          JWT_ISSUER_URI: ${{ vars.JWT_ISSUER_URI }}
+          JWT_JWK_SET_URI: ${{ vars.JWT_JWK_SET_URI }}
+        run: |
+          set -euo pipefail
+          helm upgrade --install "$HELM_RELEASE" deploy/helm/payment-platform \
+            --namespace "$K8S_NAMESPACE" \
+            --create-namespace \
+            -f deploy/helm/payment-platform/values-aws.yaml \
+            --set-string global.kafkaBootstrapServers="$KAFKA_BOOTSTRAP" \
+            --set-string global.redisHost="$REDIS_HOST" \
+            --set-string global.redisPort="$REDIS_PORT" \
+            --set-string global.jwtIssuerUri="$JWT_ISSUER_URI" \
+            --set-string global.jwtJwkSetUri="$JWT_JWK_SET_URI" \
+            --set-string services.payment.database.url="jdbc:postgresql://$PAYMENT_DB_HOST:5432/payments?sslmode=require" \
+            --set-string services.transaction.database.url="jdbc:postgresql://$TRANSACTION_DB_HOST:5432/transactions?sslmode=require" \
+            --set-string services.audit.database.url="jdbc:postgresql://$AUDIT_DB_HOST:5432/audit?sslmode=require" \
+            --set-string services.notification.database.url="jdbc:postgresql://$NOTIFICATION_DB_HOST:5432/notifications?sslmode=require" \
+            --set-string services.payment.image.repository="$ECR_REGISTRY/payment-platform/payment-service" \
+            --set-string services.transaction.image.repository="$ECR_REGISTRY/payment-platform/transaction-service" \
+            --set-string services.audit.image.repository="$ECR_REGISTRY/payment-platform/audit-service" \
+            --set-string services.notification.image.repository="$ECR_REGISTRY/payment-platform/notification-service" \
+            --set-string services.payment.image.tag="$IMAGE_TAG" \
+            --set-string services.transaction.image.tag="$IMAGE_TAG" \
+            --set-string services.audit.image.tag="$IMAGE_TAG" \
+            --set-string services.notification.image.tag="$IMAGE_TAG" \
+            --atomic --timeout 10m
+
+      - name: Verify rollouts
+        run: |
+          set -euo pipefail
+          for deployment in payment transaction audit notification; do
+            kubectl -n "$K8S_NAMESPACE" rollout status "deployment/payment-platform-$deployment" --timeout=5m
+          done
