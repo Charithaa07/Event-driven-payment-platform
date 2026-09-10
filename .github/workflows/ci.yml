@@ -17,10 +17,23 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - name: Validate observability configuration
+      - name: Validate observability and performance configuration
         run: |
           docker compose --profile observability config >/dev/null
           python -m json.tool observability/grafana/dashboards/payment-platform.json >/dev/null
+          docker run --rm \
+            --entrypoint /bin/promtool \
+            -v "$PWD/observability/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.14.0 \
+            check config /etc/prometheus/prometheus.yml
+          docker run --rm \
+            -v "$PWD/performance/k6:/scripts:ro" \
+            grafana/k6:2.2.0 inspect /scripts/payment-api.js >/dev/null
+          docker run --rm \
+            -v "$PWD/performance/k6:/scripts:ro" \
+            grafana/k6:2.2.0 inspect /scripts/idempotency-hot-key.js >/dev/null
+          bash -n performance/resilience/redis-fail-open.sh
+          bash -n performance/resilience/kafka-outage-outbox-recovery.sh
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
