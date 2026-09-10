@@ -2,7 +2,7 @@
 
 A portfolio-grade payment processing backend focused on the engineering concerns that matter in real distributed systems: **idempotent APIs, durable persistence, event-driven workflows, failure isolation, observability, and clear service boundaries**.
 
-> Status: Phase 5 — Payment command service, transactional outbox, idempotent transaction consumer, bounded Kafka retries, dead-letter recovery, and real Kafka/PostgreSQL integration testing are implemented. Auth, observability, and deployment are next.
+> Status: Phase 6 — Payment command service, Redis-backed request idempotency, transactional outbox, idempotent transaction consumer, bounded Kafka retries, dead-letter recovery, and container-backed integration testing are implemented. Auth, observability, and deployment are next.
 
 ## Why this project exists
 
@@ -13,7 +13,9 @@ Payment APIs look simple until retries, duplicate requests, partial failures, as
 ```mermaid
 flowchart LR
     C[Client] -->|POST /api/v1/payments| P[Payment Service]
-    P -->|same DB transaction| PG[(Payment PostgreSQL)]
+    P -->|idempotency response cache| R[(Redis)]
+    P -->|durability boundary| PG[(Payment PostgreSQL)]
+    P -->|same DB transaction| PG
     PG --> O[(Outbox Events)]
     O --> RLY[Outbox Relay]
     RLY --> K[(Kafka)]
@@ -22,7 +24,6 @@ flowchart LR
     T --> PE[(Processed Events)]
     T -->|retryable failure: 2 retries| T
     T -->|retries exhausted / poison event| DLT[payments.created.v1.DLT]
-    P -. planned .-> R[(Redis)]
     K -. planned .-> N[Notification Service]
     K -. planned .-> A[Audit Service]
 ```
@@ -31,7 +32,12 @@ flowchart LR
 
 - Java 17 + Spring Boot services
 - Versioned payment REST API
-- `Idempotency-Key` support backed by a database uniqueness guarantee
+- `Idempotency-Key` support backed by a PostgreSQL uniqueness guarantee
+- Redis-backed idempotency response cache with configurable TTL
+- Redis cache hits bypass the PostgreSQL idempotency lookup
+- Redis failures degrade to PostgreSQL instead of failing payment creation
+- Newly created payment responses are cached only after the database transaction commits
+- Malformed Redis cache entries are evicted and treated as cache misses
 - PostgreSQL persistence with Flyway migrations
 - Transactional outbox written in the same database transaction as the payment
 - Scheduled outbox relay publishing `payments.created.v1` events to Kafka
@@ -44,27 +50,40 @@ flowchart LR
 - Dead-letter routing to `payments.created.v1.DLT` after retries are exhausted
 - Malformed event payloads classified as non-retryable and sent directly to the DLT
 - Dead-letter publish failures surfaced instead of silently discarding records
-- Testcontainers integration tests with real PostgreSQL and Kafka containers
+- Testcontainers integration tests with real PostgreSQL, Kafka, and Redis containers
 - Integration coverage proving duplicate Kafka delivery creates one business transaction
 - Integration coverage proving malformed payloads are published to the DLT
+- Integration coverage proving Redis stores and restores complete idempotent payment responses with TTL
 - Flyway migrations exercised against an ephemeral PostgreSQL database in CI
 - Spring Boot Actuator health/metrics endpoints
-- Unit tests covering API idempotency and duplicate event consumption
+- Unit tests covering Redis fast-path/fallback behavior, API idempotency, and duplicate event consumption
 - Docker Compose for both PostgreSQL datastores, Redis, and Kafka
 - GitHub Actions Maven CI
 
-## Reliability flow
+## Request and reliability flow
 
 ```text
-HTTP payment request
+HTTP payment request + Idempotency-Key
         ↓
 Payment Service
         ↓
-BEGIN DB TRANSACTION
-  ├── INSERT payment
-  └── INSERT outbox event
-COMMIT
-        ↓
+Redis idempotency lookup
+  ├── HIT  → return cached payment response
+  └── MISS / Redis unavailable
+              ↓
+      PostgreSQL lookup by Idempotency-Key
+        ├── existing payment → return it and warm Redis
+        └── new request
+                  ↓
+          BEGIN DB TRANSACTION
+            ├── INSERT payment
+            └── INSERT outbox event
+          COMMIT
+                  ↓
+          cache payment response in Redis
+                  ↓
+              return response
+
 Outbox Relay
         ↓
 Kafka: payments.created.v1
@@ -81,7 +100,7 @@ listener returns successfully
         ↓
 Kafka offset advances
 
-On retryable failure:
+On retryable consumer failure:
 initial attempt → retry 1 → retry 2 → payments.created.v1.DLT
 
 On malformed payload:
@@ -90,13 +109,21 @@ initial attempt → payments.created.v1.DLT
 
 This design intentionally supports **at-least-once delivery**. If the consumer commits its database transaction but fails before the Kafka offset advances, the event can be delivered again. The `processed_events` table makes that redelivery safe.
 
+Redis is deliberately an optimization rather than the correctness boundary. If Redis is unavailable or contains an invalid cached value, the Payment Service falls back to PostgreSQL, where the unique `idempotency_key` constraint remains authoritative.
+
 ## Integration coverage
 
-The integration suite uses Testcontainers to start a real PostgreSQL 17 database and Apache Kafka broker during the Maven test lifecycle. It verifies behavior through the same Spring Boot application context used by the service rather than replacing Kafka or persistence with mocks.
+The integration suite uses Testcontainers to exercise production-like infrastructure during the Maven test lifecycle rather than replacing every external boundary with mocks.
+
+### Redis request-idempotency cache
+
+A real Redis container verifies that a complete payment response is serialized, stored with a TTL, and reconstructed correctly. A malformed cached payload is also injected directly into Redis to verify that the service treats it as a miss and evicts the bad value.
+
+The unit suite additionally verifies that Redis connection failures are fail-open: payment processing can continue through the PostgreSQL durability path instead of turning a cache outage into an API outage.
 
 ### Duplicate-delivery safety
 
-The test publishes the same `payments.created.v1` event twice and verifies that the Transaction Service persists exactly one `payment_transaction` and one `processed_events` record. This validates the idempotency boundary against a real database and broker.
+The Kafka/PostgreSQL integration test publishes the same `payments.created.v1` event twice and verifies that the Transaction Service persists exactly one `payment_transaction` and one `processed_events` record. This validates the consumer idempotency boundary against a real database and broker.
 
 ### Dead-letter recovery
 
@@ -121,7 +148,7 @@ curl -X POST http://localhost:8080/api/v1/payments \
   }'
 ```
 
-Repeating the request with the same `Idempotency-Key` returns the already-created payment instead of creating a duplicate.
+Repeating the request with the same `Idempotency-Key` returns the already-created payment instead of intentionally creating another one. Once the response is cached, the duplicate-request path can be served from Redis without performing the PostgreSQL idempotency lookup.
 
 ### Retrieve a payment
 
@@ -159,9 +186,17 @@ curl http://localhost:8081/actuator/health
 
 ## Engineering decisions
 
-### Request idempotency
+### Redis-backed request idempotency
 
-Client retries are normal in payment systems. The Payment Service accepts an `Idempotency-Key`, persists it with a unique database constraint, and reuses the original payment for repeated requests. A later phase will add Redis as a fast-path while PostgreSQL remains the durability boundary.
+Client retries are normal in payment systems, but sending every retry through PostgreSQL creates avoidable read pressure. The Payment Service therefore keeps the durable `Idempotency-Key` mapping in PostgreSQL and uses Redis as a short-lived response cache.
+
+The Redis value contains the payment response needed to satisfy a duplicate create request. A cache hit can return that response immediately. A cache miss falls back to PostgreSQL and warms Redis from the durable payment record.
+
+The cache is intentionally **fail-open**. Redis connection errors are logged and treated as cache misses because Redis is not the correctness boundary. PostgreSQL remains authoritative through the unique `idempotency_key` constraint.
+
+A newly created payment is not written to Redis until its surrounding database transaction has committed. This prevents Redis from advertising a payment that later rolls back because the payment or outbox write failed.
+
+Cached responses use a configurable TTL (`IDEMPOTENCY_REDIS_TTL_HOURS`, default 24 hours). Invalid cached values are evicted rather than propagated into the API response path.
 
 ### Transactional outbox
 
@@ -183,11 +218,11 @@ Not every consumer failure should be treated the same way. Temporary infrastruct
 
 The Transaction Service uses Spring Kafka's `DefaultErrorHandler` with a fixed 1-second backoff and two retries after the original delivery. If processing still fails, a `DeadLetterPublishingRecoverer` sends the original record to `payments.created.v1.DLT` with Kafka's dead-letter metadata headers.
 
-Malformed payloads throw `IllegalArgumentException` and are classified as non-retryable, so they are routed to the DLT immediately rather than wasting retry capacity. DLT publishing is configured to surface send failures rather than silently treating recovery as successful.
+Malformed payloads throw `IllegalArgumentException` and are classified as non-retryable, so they are routed to the DLT immediately rather than wasting retry capacity. DLT publishing is configured to surface send failures rather than silently treating the record as recovered.
 
 ### Integration tests use production-like infrastructure
 
-Unit tests remain useful for fast business-logic feedback, but they cannot prove broker wiring, database migrations, listener acknowledgement behavior, or DLT publishing. The Testcontainers suite therefore boots real Kafka and PostgreSQL instances in CI and exercises the service across those boundaries.
+Unit tests remain useful for fast business-logic feedback, but they cannot prove broker wiring, database migrations, Redis TTL behavior, listener acknowledgement behavior, or DLT publishing. The Testcontainers suite therefore exercises Redis, Kafka, and PostgreSQL boundaries in CI.
 
 ### Service data ownership
 
@@ -201,17 +236,18 @@ The outbox relay polls small batches from PostgreSQL and publishes them synchron
 
 - [x] Payment command API
 - [x] PostgreSQL + Flyway
+- [x] Redis idempotency fast-path
 - [x] Transactional outbox pattern
 - [x] Kafka outbox relay
 - [x] Idempotent Transaction Service Kafka consumer
 - [x] Separate service-owned transaction datastore
 - [x] Bounded Kafka retries
 - [x] Dead-letter topic recovery
+- [x] Testcontainers Redis integration tests
 - [x] Testcontainers PostgreSQL + Kafka integration tests
 - [x] Base CI pipeline
 - [ ] Notification service
 - [ ] Audit service
-- [ ] Redis idempotency fast-path
 - [ ] OAuth2/JWT authentication
 - [ ] OpenAPI documentation
 - [ ] OpenTelemetry + Prometheus/Grafana
@@ -222,7 +258,7 @@ The outbox relay polls small batches from PostgreSQL and publishes them synchron
 
 ## Tech stack
 
-**Backend:** Java 17, Spring Boot, Spring Data JPA, Spring Kafka  
+**Backend:** Java 17, Spring Boot, Spring Data JPA, Spring Data Redis, Spring Kafka  
 **Data:** PostgreSQL, Redis  
 **Messaging:** Apache Kafka  
 **Testing:** JUnit, Mockito, Testcontainers  
@@ -235,8 +271,17 @@ The outbox relay polls small batches from PostgreSQL and publishes them synchron
 event-driven-payment-platform/
 ├── payment-service/
 │   ├── src/main/java/com/charitha/payments/
+│   │   ├── api/
+│   │   ├── config/
+│   │   ├── domain/
+│   │   ├── idempotency/
+│   │   ├── messaging/
+│   │   ├── outbox/
+│   │   └── service/
 │   ├── src/main/resources/db/migration/
-│   └── src/test/
+│   └── src/test/java/com/charitha/payments/
+│       ├── idempotency/
+│       └── service/
 ├── transaction-service/
 │   ├── src/main/java/com/charitha/transactions/
 │   │   ├── config/
