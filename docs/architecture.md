@@ -1,6 +1,6 @@
 # Architecture Notes
 
-## Phase 4 request and event flow
+## Phase 5 request and event flow
 
 1. Client sends `POST /api/v1/payments` with an `Idempotency-Key`.
 2. Payment Service checks whether that key already maps to a persisted payment.
@@ -68,6 +68,19 @@ The first retry policy is intentionally simple and observable:
 
 This uses blocking retries on the consumer thread. A future scale-oriented version could move long delays to non-blocking retry topics so partitions are not held during backoff.
 
+## Container-backed integration verification
+
+The Transaction Service integration suite uses Testcontainers to boot a real PostgreSQL 17 instance and an Apache Kafka broker during CI.
+
+The database starts with an empty schema. Flyway migrations run before Hibernate validation, proving the service can bootstrap its datastore from migrations alone.
+
+The integration tests verify two reliability paths:
+
+1. The same `payments.created.v1` event is published twice. The consumer processes both deliveries but persists exactly one business transaction and one durable `processed_events` marker.
+2. A malformed JSON event is published to `payments.created.v1`. The consumer classifies the deserialization failure as non-retryable and the original record is observed on `payments.created.v1.DLT`.
+
+These tests exercise real broker and database boundaries instead of replacing them with mocks, so CI now validates event wiring, schema migration, durable idempotency, and dead-letter publication together.
+
 ## Next reliability milestones
 
-The next iterations will add Testcontainers integration tests for Kafka/PostgreSQL failure paths, operational DLT replay, and richer observability around retry counts, dead-letter volume, and consumer lag.
+The next iterations will add operational DLT replay, richer observability around retry counts/dead-letter volume/consumer lag, Redis-backed request idempotency optimization, and multi-instance outbox claiming with `SKIP LOCKED`.
