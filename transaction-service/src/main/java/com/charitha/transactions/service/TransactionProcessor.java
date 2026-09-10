@@ -24,24 +24,27 @@ public class TransactionProcessor {
     }
 
     @Transactional
-    public void process(PaymentCreatedEvent event) {
+    public boolean process(PaymentCreatedEvent event) {
         if (processedEventRepository.existsById(event.eventId())) {
-            return;
+            return false;
         }
 
-        transactionRepository.findByPaymentId(event.paymentId())
-                .orElseGet(() -> transactionRepository.save(new TransactionRecord(
-                        UUID.randomUUID(),
-                        event.paymentId(),
-                        event.eventId(),
-                        event.amount(),
-                        event.currency(),
-                        event.customerId(),
-                        TransactionStatus.RECEIVED,
-                        event.occurredAt(),
-                        Instant.now()
-                )));
+        boolean transactionCreated = transactionRepository.findByPaymentId(event.paymentId()).isEmpty();
+        if (transactionCreated) {
+            transactionRepository.save(new TransactionRecord(
+                    UUID.randomUUID(),
+                    event.paymentId(),
+                    event.eventId(),
+                    event.amount(),
+                    event.currency(),
+                    event.customerId(),
+                    TransactionStatus.RECEIVED,
+                    event.occurredAt(),
+                    Instant.now()
+            ));
+        }
 
         processedEventRepository.save(new ProcessedEvent(event.eventId(), Instant.now()));
+        return transactionCreated;
     }
 }
