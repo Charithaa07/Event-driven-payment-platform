@@ -149,7 +149,7 @@ The first relay implementation polls small batches from PostgreSQL and publishes
 ```text
 event-driven-payment-platform/
 ├── payment-service/
-│   ├── src/main/java/com/veda/payments/
+│   ├── src/main/java/com/charitha/payments/
 │   │   ├── api/
 │   │   ├── domain/
 │   │   ├── outbox/
