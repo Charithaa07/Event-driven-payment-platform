@@ -1,8 +1,8 @@
 # Event-Driven Payment Platform
 
-A portfolio-grade payment backend built to demonstrate production concerns beyond CRUD: **authenticated APIs, concurrency-safe idempotency, transactional messaging, at-least-once delivery, consumer deduplication, bounded recovery, operational replay, executable API contracts, metrics, and distributed tracing**.
+A portfolio-grade payment backend built to demonstrate production concerns beyond CRUD: **authenticated APIs, concurrency-safe idempotency, transactional messaging, at-least-once delivery, consumer deduplication, bounded recovery, operational replay, immutable audit evidence, executable API contracts, metrics, and distributed tracing**.
 
-> Status: **Phase 10** — the secured Payment Service and idempotent Transaction Service now include OpenAPI/Swagger, Prometheus metrics, OpenTelemetry/OTLP tracing, Kafka observation, durable dead-letter indexing, a secured DLT inspection/replay workflow, a provisioned Grafana dashboard, and container-backed CI verification.
+> Status: **Phase 11** — Payment, Transaction, and Audit services now run as independent Spring Boot services with separate datastores. The platform includes transactional outbox delivery, idempotent processing, durable DLT recovery, OAuth2/JWT authorization, OpenAPI, Prometheus/OpenTelemetry observability, and an append-only audit trail for payment-created events.
 
 ## Architecture
 
@@ -10,14 +10,15 @@ A portfolio-grade payment backend built to demonstrate production concerns beyon
 flowchart LR
     IDP[OAuth2 / OIDC Provider] -->|JWKS| P[Payment Service]
     IDP -->|JWKS| T[Transaction Service]
+    IDP -->|JWKS| A[Audit Service]
     C[Client] -->|Bearer JWT + REST| P
-    DOC[Swagger UI / OpenAPI] --> P
     P --> R[(Redis)]
     P --> PG[(Payment PostgreSQL)]
     PG --> O[(Outbox Events)]
     O --> RLY[Outbox Relay]
     RLY --> K[(Kafka)]
     K --> T
+    K --> A
     T --> TG[(Transaction PostgreSQL)]
     T --> PE[(Processed Events)]
     T --> DLT[payments.created.v1.DLT]
@@ -25,41 +26,41 @@ flowchart LR
     IDX --> DR[(Dead Letter Events)]
     OPS[Operator] -->|ops:read / ops:write| T
     DR -->|claimed replay| K
+    A --> AG[(Audit PostgreSQL)]
+    AUD[Auditor] -->|audit:read| A
+    A --> ADLT[payments.created.v1.audit.DLT]
 
-    P -. Prometheus metrics .-> PROM[Prometheus]
-    T -. Prometheus metrics .-> PROM
-    P -. OTLP traces .-> TEMPO[Tempo]
-    T -. OTLP traces .-> TEMPO
-    PROM --> G[Grafana]
-    TEMPO --> G
+    P -. metrics / traces .-> OBS[Prometheus + Tempo]
+    T -. metrics / traces .-> OBS
+    A -. metrics / traces .-> OBS
+    OBS --> G[Grafana]
 ```
 
 ## Engineering highlights
 
 - **Java 17 + Spring Boot 4** multi-service Maven project
 - **OAuth2/JWT Resource Servers** with JWKS signature validation, issuer/audience/timing validation, and scope authorization
-- Customer identity derived from JWT `sub`; callers cannot spoof ownership through request JSON
+- Customer identity derived from JWT `sub`; payment callers cannot spoof ownership through request JSON
 - Customer-scoped `Idempotency-Key` semantics in PostgreSQL and Redis
 - Concurrency-safe payment creation using PostgreSQL `ON CONFLICT DO NOTHING`
-- `409 Conflict` when the same customer reuses an idempotency key with different payment semantics
-- Redis idempotency fast path with PostgreSQL as the durability/source-of-truth fallback
+- Redis idempotency fast path with PostgreSQL as the durability boundary
 - **Transactional outbox** so payment state and event intent commit atomically
 - Multi-instance outbox claiming with `FOR UPDATE SKIP LOCKED`, leases, retry backoff, and terminal failure state
-- Kafka publication outside the short claim transaction
-- Separate Transaction Service database and durable `processed_events` consumer idempotency
-- Original delivery + two Kafka retries, then `payments.created.v1.DLT`
-- **Durable DLT index** capturing Kafka position, original record metadata, failure class/message, payload, and replay audit state
-- **Secured operational recovery API** with `ops:read` inspection and `ops:write` replay authorization
-- Atomic `REPLAYING` claims with stale-claim recovery so concurrent operators cannot replay the same record simultaneously
-- Replay publishes outside the DB claim transaction and records operator identity, attempt count, outcome, and errors
-- Runtime-generated **OpenAPI contract + Swagger UI** for the Payment Service
-- **Prometheus + Micrometer** metrics for HTTP/JVM/Kafka plus domain reliability and DLT-recovery telemetry
-- **OpenTelemetry/OTLP** tracing with Kafka observation enabled
+- Separate Transaction Service datastore with durable `processed_events` idempotency
+- Bounded Kafka retries plus durable DLT indexing and secured operational replay
+- **Separate Audit Service datastore** consuming `payments.created.v1` independently
+- Audit records deduplicated by immutable event ID and Kafka source position
+- **Database-enforced append-only audit table**: PostgreSQL rejects UPDATE and DELETE operations
+- SHA-256 integrity digest over immutable event metadata + original payload, verified on detail reads
+- Read-only audit timeline/detail API protected by `audit:read`
+- Malformed audit-consumer records isolated to `payments.created.v1.audit.DLT`
+- Runtime-generated **OpenAPI + Swagger UI** for externally queryable service APIs
+- **Prometheus + Micrometer** metrics and **OpenTelemetry/OTLP** tracing
 - Provisioned **Prometheus + Grafana + Tempo** local observability profile
 - Testcontainers integration coverage with real PostgreSQL, Redis, and Kafka
-- GitHub Actions CI validates Maven tests, Compose configuration, and Grafana dashboard JSON
+- GitHub Actions CI validates infrastructure configuration and the full Maven reactor
 
-## Request and reliability flow
+## Core payment flow
 
 ```text
 Authenticated customer + Idempotency-Key
@@ -67,13 +68,11 @@ Authenticated customer + Idempotency-Key
         v
 customer-scoped Redis cache
   |-- HIT --> compare request --> original payment / 409
-  |
   `-- MISS / unavailable
              |
              v
 PostgreSQL (customer_id, idempotency_key)
   |-- existing --> compare --> return / 409
-  |
   `-- absent
        |
        v
@@ -82,127 +81,87 @@ INSERT ... ON CONFLICT DO NOTHING
   `-- loser  --> load winner and return same result
 ```
 
-Redis is an optimization, not the correctness boundary. New cache entries are written after the database transaction commits, and the durable uniqueness constraint remains authoritative during cache misses, outages, and concurrent requests.
+The outbox relay claims rows with `FOR UPDATE SKIP LOCKED`, commits the short claim transaction, then publishes to Kafka. Delivery remains intentionally **at least once**, so downstream services must be idempotent.
 
-## Outbox and consumer flow
+## Transaction and DLT recovery
+
+Transaction Service consumes `payments.created.v1`, writes the business transaction and `processed_events` marker atomically, and ignores duplicate event IDs. Retryable failures receive two retries; exhausted or malformed records go to `payments.created.v1.DLT`.
+
+The DLT is indexed durably for operations. `ops:read` allows inspection and `ops:write` allows replay. Replay uses an atomic `REPLAYING` claim with a stale-claim lease and publishes outside the database transaction. A crash after Kafka acknowledgment can still produce a duplicate replay, which is safe because the Transaction Service consumer is idempotent.
+
+## Immutable Audit Service
+
+Audit Service consumes the same `payments.created.v1` stream using its own consumer group, so audit ingestion is independent of Transaction Service business processing.
 
 ```text
-payment + PENDING outbox row
-        |
-        v
-FOR UPDATE SKIP LOCKED
-mark PROCESSING + lease
-COMMIT
-        |
-        v
-Kafka publish
-  |-- success --> PUBLISHED
-  `-- failure --> bounded backoff --> FAILED after max attempts
-        |
-        v
 payments.created.v1
         |
-        v
-Transaction Service
-  |-- new event --> transaction + processed_events in one DB transaction
-  |-- duplicate --> no duplicate business transaction
-  `-- failure --> retry 1 --> retry 2 --> payments.created.v1.DLT
+        +------------------------------+
+        |                              |
+        v                              v
+Transaction Service              Audit Service
+business state                   append-only evidence
+        |                              |
+        v                              v
+Transaction DB                    Audit DB
+                               event_id PK
+                               Kafka topic/partition/offset
+                               aggregate/customer identity
+                               original JSON payload
+                               SHA-256 record digest
+                               occurred_at / recorded_at
 ```
 
-The messaging guarantee is intentionally **at least once**. A producer-side retry or crash can cause redelivery, so consumer idempotency is part of the design rather than an optional optimization.
+### Audit correctness boundaries
 
-## Operational DLT recovery
+- `event_id` is the logical idempotency key; replaying the same business event does not create a second audit row.
+- `(source_topic, source_partition, source_offset)` is also unique, protecting against repeated delivery of the same Kafka record.
+- `record_sha256` covers event ID, event type, payment aggregate ID, customer ID, Kafka source position, and the original payload.
+- A PostgreSQL trigger rejects `UPDATE` and `DELETE` against `audit_events`, making append-only behavior a database invariant rather than a controller convention.
+- Timeline responses omit the raw payload; event-detail responses include it and report `integrityValid` after recomputing the digest.
+- Invalid audit payloads do not poison the primary consumer indefinitely; they are sent to `payments.created.v1.audit.DLT`.
 
-The DLT is not treated as a permanent message graveyard. A dedicated Transaction Service consumer indexes dead-letter records into its PostgreSQL database for operational inspection and replay.
+This phase intentionally audits **payment-created events**. Additional lifecycle topics can be added later without coupling Audit Service to another service's database.
 
-```text
-payments.created.v1.DLT
-        |
-        v
-DLT indexer
-  |-- DLT topic / partition / offset
-  |-- original topic / partition / offset / consumer group
-  |-- message key + payload
-  |-- failure class + failure message
-  `-- PENDING recovery status
-        |
-        v
-operator inspects with ops:read
-        |
-        v
-POST /api/v1/operations/dlt/{id}/replay  [ops:write]
-        |
-        v
-atomic DB claim: PENDING/FAILED -> REPLAYING
-        |
-        v
-Kafka publish outside DB transaction
-  |-- success --> REPLAYED + replayed_at + replayed_by
-  `-- failure --> FAILED + last_replay_error
-```
+## API and authorization
 
-The replay claim has a 30-second stale lease. If an instance dies after claiming but before completing the replay, another request can recover the stale claim. Once a record reaches `REPLAYED`, repeating the replay request is idempotent and does not intentionally republish it.
-
-Replay is still **at least once**: a crash after Kafka acknowledges the replay but before PostgreSQL records `REPLAYED` can cause a later replay. The downstream `processed_events` guard makes that duplicate safe.
-
-A deterministic poison payload should only be replayed after the underlying data/code issue is corrected; replaying the same invalid payload will naturally return to the DLT.
-
-## API and security
-
-The Payment Service and Transaction Service validate bearer access tokens issued by an external OAuth2/OIDC provider. Neither service mints credentials.
-
-| Operation | Authorization |
+| Service / operation | Authorization |
 | --- | --- |
-| `POST /api/v1/payments` | `payments:write` |
-| `GET /api/v1/payments/{paymentId}` | `payments:read` + JWT-sub ownership |
-| `GET /api/v1/operations/dlt` | `ops:read` |
-| `GET /api/v1/operations/dlt/{eventId}` | `ops:read` |
-| `POST /api/v1/operations/dlt/{eventId}/replay` | `ops:write` |
+| Payment `POST /api/v1/payments` | `payments:write` |
+| Payment `GET /api/v1/payments/{paymentId}` | `payments:read` + JWT-sub ownership |
+| Transaction `GET /api/v1/operations/dlt/**` | `ops:read` |
+| Transaction `POST /api/v1/operations/dlt/{eventId}/replay` | `ops:write` |
+| Audit `GET /api/v1/audit/payments/{paymentId}` | `audit:read` |
+| Audit `GET /api/v1/audit/events/{eventId}` | `audit:read` |
 | `/actuator/metrics/**` | `ops:read` |
 | `/actuator/prometheus` | `ops:read` by default |
 | `/actuator/health`, `/actuator/info` | public probe endpoints |
-| Payment Service `/v3/api-docs`, `/swagger-ui.html` | public documentation |
+| `/v3/api-docs`, `/swagger-ui.html` | public API documentation where enabled |
 
-The DLT list endpoint intentionally omits the payload. Operators with `ops:read` can retrieve an individual detail record when payload inspection is necessary. Replay audit metadata records the authenticated operator's JWT `sub`.
-
-### OpenAPI
-
-- Swagger UI: `http://localhost:8080/swagger-ui.html`
-- OpenAPI JSON: `http://localhost:8080/v3/api-docs`
-- OpenAPI YAML: `http://localhost:8080/v3/api-docs.yaml`
-
-The generated Payment Service contract documents JWT bearer authentication, required scopes, `Idempotency-Key`, schema validation, examples, and `400 / 401 / 403 / 404 / 409` behavior. Integration tests inspect the generated document so controller/security changes cannot silently remove important contract metadata.
+Audit Service uses a logical JWT audience of `audit-api`, configurable with `AUDIT_JWT_AUDIENCE`. Transaction operational APIs use their own configured audience; Payment Service defaults to `payment-api`.
 
 ## Observability
 
-Both services export Micrometer metrics to Prometheus and can export traces over OTLP to Tempo.
+All three services expose framework telemetry through Micrometer and can export traces over OTLP. Kafka producer/listener observation remains enabled.
 
-### Domain reliability telemetry
+Domain-specific metrics include:
 
-Payment Service exposes:
+- `payments.outbox.events{status=...}`
+- `payments.outbox.publish.events{outcome=...}`
+- `payments.outbox.publish.latency`
+- `transactions.payment.events{outcome=...}`
+- `transactions.kafka.dlt*`
+- `audit.payment.events{outcome=received|stored|duplicate|malformed|dead_lettered}`
 
-- `payments.outbox.events{status=pending|processing|failed}` — current outbox backlog
-- `payments.outbox.publish.events{outcome=success|failure}` — publish outcomes
-- `payments.outbox.publish.latency` — Kafka publication latency
-
-Transaction Service exposes:
-
-- `transactions.payment.events{outcome=received|created|duplicate|malformed}`
-- `transactions.payment.processing.latency{outcome=created|duplicate}`
-- `transactions.kafka.dlt` — dead-letter publications
-- `transactions.kafka.dlt.indexed` — DLT records durably indexed
-- `transactions.kafka.dlt.replay{outcome=success|failure}` — operator replay outcomes
-- `transactions.kafka.dlt.backlog` — PENDING + FAILED records awaiting recovery
-
-The provisioned Grafana dashboard combines request rate, p95 API latency, JVM heap, outbox backlog, publish failures, transaction outcomes, processing latency, and DLT activity.
+Prometheus is configured to scrape local service ports `8080`, `8081`, and `8082`. The local `OBSERVABILITY_PUBLIC_PROMETHEUS=true` switch exists only for unauthenticated developer scraping; production/shared deployments should keep metrics protected.
 
 ### Trace boundary
 
-Kafka observation is enabled on the producer template and listener container. However, the transactional outbox currently persists the **business event payload only**. The original HTTP transaction finishes before the relay later reads that outbox row, so the HTTP request trace and the asynchronous outbox-relay trace are separate unless trace context is explicitly persisted with the outbox event in a future enhancement.
+The transactional outbox currently persists business payload but not the original HTTP W3C trace context. The HTTP request and later scheduled outbox-relay trace are therefore separate traces. Kafka observation can propagate the relay trace to downstream consumers, but the repository does not claim false HTTP-to-consumer continuity.
 
 ## Run locally
 
-Prerequisites: Java 17+, Maven, Docker, and an OAuth2/OIDC provider (or test issuer) with a JWKS endpoint.
+Prerequisites: Java 17+, Maven, Docker, and an OAuth2/OIDC provider or test issuer exposing JWKS.
 
 ```bash
 docker compose up -d
@@ -210,46 +169,47 @@ docker compose up -d
 export JWT_ISSUER_URI=https://issuer.example.com/
 export JWT_AUDIENCE=payment-api
 export TRANSACTION_JWT_AUDIENCE=transaction-ops-api
+export AUDIT_JWT_AUDIENCE=audit-api
 export JWT_JWK_SET_URI=https://issuer.example.com/.well-known/jwks.json
 
 mvn spring-boot:run -pl payment-service
 mvn spring-boot:run -pl transaction-service
+mvn spring-boot:run -pl audit-service
 ```
 
-Run all tests:
+Service ports:
+
+- Payment Service: `8080`
+- Transaction Service: `8081`
+- Audit Service: `8082`
+- Payment PostgreSQL: `5432`
+- Transaction PostgreSQL: `5433`
+- Audit PostgreSQL: `5434`
+
+Run all unit and container-backed integration tests:
 
 ```bash
 mvn --batch-mode test
 ```
 
-### Run local observability
+Start local monitoring with:
 
 ```bash
 docker compose --profile observability up -d
-
 export OBSERVABILITY_PUBLIC_PROMETHEUS=true
 export OTEL_TRACING_ENABLED=true
 export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
-export TRACING_SAMPLING_PROBABILITY=1.0
 ```
 
-Then start both application services. Local tools:
-
-- Grafana: `http://localhost:3000`
-- Prometheus: `http://localhost:9090`
-- Tempo: `http://localhost:3200`
-
-`OBSERVABILITY_PUBLIC_PROMETHEUS=true` exists only so the local unauthenticated Prometheus container can scrape the application services. **Leave it false in shared/production environments** and use an authenticated or otherwise protected scrape path.
+Grafana is on `localhost:3000`, Prometheus on `localhost:9090`, and Tempo on `localhost:3200`.
 
 ## Verification
 
-The integration suite exercises real infrastructure boundaries rather than only mocks.
+**Payment Service:** PostgreSQL + Redis tests cover concurrent/customer-scoped idempotency, rollback/cache behavior, outbox claiming, JWT authorization/ownership, OpenAPI, and Prometheus metrics.
 
-**Payment Service:** PostgreSQL + Redis tests cover concurrent idempotency, customer isolation, conflicting retries, transaction rollback/cache behavior, outbox persistence/claiming, HTTP authentication/authorization, ownership, OpenAPI generation, and protected Prometheus metrics.
+**Transaction Service:** Kafka + PostgreSQL tests cover duplicate delivery, DLT indexing, secured replay, repeat-replay safety, and operational scopes.
 
-**Transaction Service:** Kafka + PostgreSQL tests verify duplicate delivery produces one business transaction, malformed events reach and are indexed from the DLT, replayed events re-enter the original topic and create the intended transaction, repeat replay calls remain idempotent after `REPLAYED`, and the operations API enforces `ops:read` / `ops:write` boundaries.
-
-CI additionally validates the Docker Compose observability profile and parses the provisioned Grafana dashboard as JSON before running the full Maven reactor.
+**Audit Service:** Kafka + PostgreSQL tests verify logical duplicate events produce one record, stored hashes verify successfully, PostgreSQL rejects audit mutation, malformed records reach the audit DLT, audit query APIs enforce `audit:read`, timeline responses do not expose payloads, detail reads verify integrity, and OpenAPI remains public.
 
 ## Roadmap
 
@@ -259,21 +219,19 @@ CI additionally validates the Docker Compose observability profile and parses th
 - [x] Concurrent and customer-scoped idempotency
 - [x] Transactional outbox
 - [x] Multi-instance `SKIP LOCKED` outbox claiming
-- [x] Outbox leases, bounded retry/backoff, terminal failure state
 - [x] Idempotent Transaction Service consumer
 - [x] Kafka retries + dead-letter recovery
-- [x] Durable DLT indexing + failure diagnostics
-- [x] Secured DLT inspection + operational replay
-- [x] PostgreSQL / Redis / Kafka Testcontainers tests
+- [x] Durable DLT indexing + secured operational replay
 - [x] OAuth2/JWT authentication and authorization
-- [x] JWT-derived customer ownership
-- [x] OpenAPI contract + Swagger UI
-- [x] Prometheus metrics + custom reliability telemetry
-- [x] OpenTelemetry/OTLP tracing + Kafka observations
-- [x] Provisioned Grafana + Tempo local stack
+- [x] OpenAPI + Swagger UI
+- [x] Prometheus + OpenTelemetry + Grafana/Tempo
+- [x] **Immutable Audit Service + dedicated PostgreSQL datastore**
+- [x] Audit event idempotency + SHA-256 integrity verification
+- [x] Database-enforced append-only audit records
+- [x] PostgreSQL / Redis / Kafka Testcontainers verification
 - [x] GitHub Actions CI
 - [ ] Notification service
-- [ ] Audit service
+- [ ] Expand audit ingestion to additional lifecycle topics
 - [ ] Kubernetes manifests / Helm
 - [ ] AWS deployment architecture
 
@@ -294,11 +252,15 @@ CI additionally validates the Docker Compose observability profile and parses th
 event-driven-payment-platform/
 ├── payment-service/
 ├── transaction-service/
-│   └── src/main/java/com/charitha/transactions/recovery/
+├── audit-service/
+│   └── src/main/java/com/charitha/audit/
+│       ├── api/
+│       ├── config/
+│       ├── domain/
+│       ├── messaging/
+│       ├── observability/
+│       └── service/
 ├── observability/
-│   ├── prometheus/
-│   ├── tempo/
-│   └── grafana/
 ├── docs/
 ├── .github/workflows/ci.yml
 ├── docker-compose.yml
@@ -308,4 +270,4 @@ event-driven-payment-platform/
 
 ## Design principle
 
-Each milestone introduces a concrete production concern and documents the trade-off it solves. The repository evolves through reviewable PRs so the history demonstrates engineering decisions, failure modes, and verification rather than a one-shot code dump.
+Each milestone introduces a concrete production concern and documents the trade-off it solves. The repository evolves through reviewable PRs so its history demonstrates service boundaries, failure modes, correctness invariants, and executable verification rather than a one-shot code dump.
