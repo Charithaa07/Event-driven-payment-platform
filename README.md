@@ -2,7 +2,7 @@
 
 A portfolio-grade payment processing backend focused on the engineering concerns that matter in real distributed systems: **idempotent APIs, durable persistence, event-driven workflows, failure isolation, observability, and clear service boundaries**.
 
-> Status: Phase 3 — Payment command service, transactional outbox, and idempotent transaction consumer are implemented. Retry/DLQ, auth, observability, and deployment modules are next.
+> Status: Phase 4 — Payment command service, transactional outbox, idempotent transaction consumer, bounded Kafka retries, and dead-letter recovery are implemented. Auth, observability, integration testing, and deployment are next.
 
 ## Why this project exists
 
@@ -20,6 +20,8 @@ flowchart LR
     K --> T[Transaction Service]
     T --> TG[(Transaction PostgreSQL)]
     T --> PE[(Processed Events)]
+    T -->|retryable failure: 2 retries| T
+    T -->|retries exhausted / poison event| DLT[payments.created.v1.DLT]
     P -. planned .-> R[(Redis)]
     K -. planned .-> N[Notification Service]
     K -. planned .-> A[Audit Service]
@@ -36,8 +38,12 @@ flowchart LR
 - At-least-once event delivery semantics
 - Separate Transaction Service with its own PostgreSQL datastore
 - Idempotent Kafka consumer using durable `processed_events` records
-- Kafka acknowledgement only after the local transaction completes
+- Record-level Kafka acknowledgement after successful local processing
 - Payment-level uniqueness guard to prevent duplicate transaction rows
+- Bounded consumer retries: 2 retries with 1-second backoff after the initial attempt
+- Dead-letter routing to `payments.created.v1.DLT` after retries are exhausted
+- Malformed event payloads classified as non-retryable and sent directly to the DLT
+- Dead-letter publish failures surfaced instead of silently discarding records
 - Spring Boot Actuator health/metrics endpoints
 - Unit tests covering API idempotency and duplicate event consumption
 - Docker Compose for both PostgreSQL datastores, Redis, and Kafka
@@ -67,10 +73,18 @@ BEGIN DB TRANSACTION
   └── INSERT processed_event
 COMMIT
         ↓
-acknowledge Kafka offset
+listener returns successfully
+        ↓
+Kafka offset advances
+
+On retryable failure:
+initial attempt → retry 1 → retry 2 → payments.created.v1.DLT
+
+On malformed payload:
+initial attempt → payments.created.v1.DLT
 ```
 
-This design intentionally supports **at-least-once delivery**. If the consumer commits its database transaction but crashes before acknowledging Kafka, the event may be delivered again. The `processed_events` table makes that redelivery safe.
+This design intentionally supports **at-least-once delivery**. If the consumer commits its database transaction but fails before the Kafka offset advances, the event can be delivered again. The `processed_events` table makes that redelivery safe.
 
 ## API
 
@@ -131,11 +145,19 @@ The current flow persists both the payment and its outbox record inside the same
 
 ### Idempotent consumer
 
-The Transaction Service stores processed Kafka event IDs in its own PostgreSQL database. The transaction row and the processed-event marker are committed together. Kafka is acknowledged only after processing completes.
+The Transaction Service stores processed Kafka event IDs in its own PostgreSQL database. The transaction row and the processed-event marker are committed together.
 
-This means a crash between database commit and Kafka acknowledgement may cause redelivery, but the same event cannot reproduce the business side effect.
+With record-level acknowledgements, the Kafka offset advances after the listener returns successfully. Since `TransactionProcessor.process()` is transactional, that return happens after its local database transaction has completed. A redelivery can still occur around process failure boundaries, so the durable `processed_events` check remains necessary.
 
 The service also enforces uniqueness on `payment_id` and `source_event_id`, providing a second database-level guard against duplicate writes.
+
+### Bounded retries and dead-letter recovery
+
+Not every consumer failure should be treated the same way. Temporary infrastructure or database failures may succeed on another attempt, while malformed payloads will fail identically every time.
+
+The Transaction Service uses Spring Kafka's `DefaultErrorHandler` with a fixed 1-second backoff and two retries after the original delivery. If processing still fails, a `DeadLetterPublishingRecoverer` sends the original record to `payments.created.v1.DLT` with Kafka's dead-letter metadata headers.
+
+Malformed payloads throw `IllegalArgumentException` and are classified as non-retryable, so they are routed to the DLT immediately rather than wasting retry capacity. DLT publishing is configured to surface send failures rather than silently treating recovery as successful.
 
 ### Service data ownership
 
@@ -153,8 +175,9 @@ The outbox relay polls small batches from PostgreSQL and publishes them synchron
 - [x] Kafka outbox relay
 - [x] Idempotent Transaction Service Kafka consumer
 - [x] Separate service-owned transaction datastore
+- [x] Bounded Kafka retries
+- [x] Dead-letter topic recovery
 - [x] Base CI pipeline
-- [ ] Retry topics + dead-letter queue
 - [ ] Notification service
 - [ ] Audit service
 - [ ] Redis idempotency fast-path
@@ -162,6 +185,7 @@ The outbox relay polls small batches from PostgreSQL and publishes them synchron
 - [ ] OpenAPI documentation
 - [ ] Testcontainers integration tests
 - [ ] OpenTelemetry + Prometheus/Grafana
+- [ ] DLT replay / operational recovery endpoint
 - [ ] Multi-instance outbox claiming with `SKIP LOCKED`
 - [ ] Kubernetes manifests / Helm
 - [ ] AWS deployment architecture
@@ -184,6 +208,11 @@ event-driven-payment-platform/
 │   └── src/test/
 ├── transaction-service/
 │   ├── src/main/java/com/charitha/transactions/
+│   │   ├── config/
+│   │   ├── domain/
+│   │   ├── idempotency/
+│   │   ├── messaging/
+│   │   └── service/
 │   ├── src/main/resources/db/migration/
 │   └── src/test/
 ├── docs/
