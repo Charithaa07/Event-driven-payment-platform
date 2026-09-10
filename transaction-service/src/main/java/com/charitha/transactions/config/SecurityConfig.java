@@ -23,7 +23,7 @@ public class SecurityConfig {
     @Bean
     SecurityFilterChain securityFilterChain(
             HttpSecurity http,
-            @Value("${observability.prometheus.public:false}") boolean publicPrometheus) throws Exception {
+            @Value("${security.observability.public-prometheus:false}") boolean publicPrometheus) throws Exception {
         http
                 .csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
@@ -38,16 +38,17 @@ public class SecurityConfig {
                     if (publicPrometheus) {
                         authorize.requestMatchers("/actuator/prometheus").permitAll();
                     } else {
-                        authorize.requestMatchers("/actuator/metrics", "/actuator/metrics/**", "/actuator/prometheus")
+                        authorize.requestMatchers("/actuator/prometheus")
                                 .hasAuthority("SCOPE_ops:read");
                     }
 
-                    authorize
-                            .requestMatchers(HttpMethod.POST, "/api/v1/operations/dlt/*/replay")
-                                    .hasAuthority("SCOPE_ops:write")
-                            .requestMatchers(HttpMethod.GET, "/api/v1/operations/dlt/**")
-                                    .hasAuthority("SCOPE_ops:read")
-                            .anyRequest().authenticated();
+                    authorize.requestMatchers("/actuator/metrics", "/actuator/metrics/**")
+                            .hasAuthority("SCOPE_ops:read");
+                    authorize.requestMatchers(HttpMethod.POST, "/api/v1/operations/dlt/*/replay")
+                            .hasAuthority("SCOPE_ops:write");
+                    authorize.requestMatchers(HttpMethod.GET, "/api/v1/operations/dlt/**")
+                            .hasAuthority("SCOPE_ops:read");
+                    authorize.anyRequest().authenticated();
                 })
                 .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()));
 
