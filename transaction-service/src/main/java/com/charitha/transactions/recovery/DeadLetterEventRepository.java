@@ -13,6 +13,8 @@ public interface DeadLetterEventRepository extends JpaRepository<DeadLetterEvent
 
     List<DeadLetterEvent> findTop100ByStatusOrderByReceivedAtDesc(DeadLetterStatus status);
 
+    long countByStatus(DeadLetterStatus status);
+
     @Modifying
     @Query(value = """
             INSERT INTO dead_letter_events (
