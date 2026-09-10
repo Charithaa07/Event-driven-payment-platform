@@ -28,12 +28,6 @@ variable "kubernetes_version" {
   default     = "1.36"
 }
 
-variable "eks_public_access_cidrs" {
-  description = "CIDRs allowed to reach the public EKS API endpoint. Tighten for shared environments or use a private runner."
-  type        = list(string)
-  default     = ["0.0.0.0/0"]
-}
-
 variable "node_instance_types" {
   description = "Managed node group instance types."
   type        = list(string)
