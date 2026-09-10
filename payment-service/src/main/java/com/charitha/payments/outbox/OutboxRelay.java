@@ -1,5 +1,6 @@
 package com.charitha.payments.outbox;
 
+import com.charitha.payments.observability.OutboxMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -20,32 +21,39 @@ public class OutboxRelay {
     private final OutboxClaimService claimService;
     private final OutboxDeliveryService deliveryService;
     private final KafkaTemplate<Object, Object> kafkaTemplate;
+    private final OutboxMetrics metrics;
     private final long publishTimeoutMs;
 
     public OutboxRelay(
             OutboxClaimService claimService,
             OutboxDeliveryService deliveryService,
             KafkaTemplate<Object, Object> kafkaTemplate,
+            OutboxMetrics metrics,
             @Value("${outbox.relay.publish-timeout-ms:10000}") long publishTimeoutMs) {
         this.claimService = claimService;
         this.deliveryService = deliveryService;
         this.kafkaTemplate = kafkaTemplate;
+        this.metrics = metrics;
         this.publishTimeoutMs = publishTimeoutMs;
     }
 
     @Scheduled(fixedDelayString = "${outbox.relay.fixed-delay-ms:1000}")
     public void publishPendingEvents() {
         for (OutboxMessage event : claimService.claimBatch()) {
+            long startedAt = System.nanoTime();
             try {
                 kafkaTemplate
                         .send(event.topic(), event.aggregateId().toString(), event.payload())
                         .get(publishTimeoutMs, TimeUnit.MILLISECONDS);
                 deliveryService.markPublished(event.id());
+                metrics.recordSuccess(System.nanoTime() - startedAt);
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
+                metrics.recordFailure(System.nanoTime() - startedAt);
                 recordFailure(event, ex);
                 return;
             } catch (ExecutionException | TimeoutException | RuntimeException ex) {
+                metrics.recordFailure(System.nanoTime() - startedAt);
                 recordFailure(event, ex);
             }
         }

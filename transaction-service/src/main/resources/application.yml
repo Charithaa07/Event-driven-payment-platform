@@ -24,6 +24,9 @@ spring:
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
     listener:
       ack-mode: record
+      observation-enabled: true
+    template:
+      observation-enabled: true
 
 topics:
   payment-created: payments.created.v1
@@ -33,6 +36,37 @@ management:
     web:
       exposure:
         include: health,info,metrics,prometheus
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+      environment: ${DEPLOYMENT_ENVIRONMENT:local}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        spring.kafka.listener: true
+        spring.kafka.template: true
+        transactions.payment.processing.latency: true
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+    export:
+      otlp:
+        enabled: ${OTEL_TRACING_ENABLED:false}
+    exemplars:
+      include: sampled-traces
+  opentelemetry:
+    resource-attributes:
+      service.name: ${spring.application.name}
+      service.namespace: event-driven-payment-platform
+      deployment.environment: ${DEPLOYMENT_ENVIRONMENT:local}
+    tracing:
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
 
 server:
   port: ${PORT:8081}

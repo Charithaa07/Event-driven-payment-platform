@@ -1,116 +1,100 @@
 # Architecture Notes
 
-## Phase 8 request and event flow
+## Phase 9 system flow
 
-1. A client obtains a bearer access token from an external OAuth2/OIDC provider.
-2. Payment Service acts as a stateless OAuth2 Resource Server and validates the JWT signature against the configured JWKS.
-3. The token is also validated for issuer, audience, expiry/timing, and a non-empty subject no longer than the payment `customer_id` boundary.
-4. `POST /api/v1/payments` requires `payments:write`; `GET /api/v1/payments/{id}` requires `payments:read`.
-5. The JWT `sub` claim becomes the trusted customer identity. `customerId` is not accepted as trusted create-payment input.
-6. Payment retrieval queries by both payment ID and authenticated customer ID. A resource owned by another customer therefore resolves as `404`.
-7. Payment request idempotency is scoped by `(customer_id, idempotency_key)` in PostgreSQL and by a hashed customer/key namespace in Redis.
-8. On a Redis miss or failure, Payment Service checks PostgreSQL for that authenticated customer's durable idempotency mapping.
-9. If absent, Payment Service attempts `INSERT ... ON CONFLICT DO NOTHING` against the customer-scoped uniqueness constraint.
-10. The winning insert creates the payment and `payments.created.v1` outbox record in the same transaction; a losing concurrent request loads the same customer's winner.
-11. Redis is populated only after the payment/outbox transaction commits.
-12. The outbox relay claims eligible rows in a short transaction using `FOR UPDATE SKIP LOCKED`, records a processing lease, and commits the claim before Kafka I/O.
-13. Successful publication marks the event `PUBLISHED`; failure schedules bounded backoff or eventually marks it `FAILED`.
-14. Transaction Service consumes `payments.created.v1`, commits its business transaction and `processed_events` marker together, and safely tolerates redelivery.
-15. Retryable consumer failures receive two retries; exhausted or malformed events are routed to `payments.created.v1.DLT`.
-16. springdoc derives an OpenAPI contract from Payment Service controllers, validation constraints, schemas, and explicit operation metadata.
-17. `/v3/api-docs`, `/v3/api-docs.yaml`, and the Swagger UI are publicly readable documentation surfaces; access to payment resources remains protected by Spring Security.
-18. Integration tests inspect the generated OpenAPI contract so security metadata, paths, idempotency headers, and response documentation cannot silently disappear.
+1. A client obtains an access token from an external OAuth2/OIDC provider.
+2. Payment Service validates JWT signature, issuer, audience, timing, subject, and OAuth scopes.
+3. JWT `sub` is the trusted customer identity; payment reads and idempotency are scoped to that customer.
+4. Redis provides the idempotency fast path while PostgreSQL remains authoritative.
+5. A new payment and its `payments.created.v1` outbox event commit atomically.
+6. The outbox relay claims work with `FOR UPDATE SKIP LOCKED`, releases the DB transaction, then publishes to Kafka.
+7. Transaction Service consumes the event and commits the business transaction plus `processed_events` marker atomically.
+8. Retryable Kafka failures receive two retries; exhausted or malformed events go to `payments.created.v1.DLT`.
+9. springdoc generates the Payment Service OpenAPI contract and Swagger UI from runtime API metadata.
+10. Micrometer exposes framework and domain metrics through Prometheus endpoints.
+11. OpenTelemetry exports sampled traces over OTLP when tracing export is enabled.
+12. Kafka producer/listener observation is enabled so normal Kafka records can carry tracing context.
+13. Prometheus, Tempo, and Grafana form the local observability plane.
+
+## Runtime architecture
+
+```text
+OAuth2/OIDC Provider
+        |
+        | JWKS
+        v
+Client -> Payment Service -> Redis
+              |
+              +-> Payment PostgreSQL
+                       |
+                       `-> Outbox
+                            |
+                    SKIP LOCKED claim
+                            |
+                            v
+                      Outbox Relay
+                            |
+                            v
+                          Kafka
+                            |
+                            v
+                    Transaction Service
+                       |            |
+                       v            v
+              Transaction DB      DLT
+
+Payment Service ------ Prometheus scrape ------+
+Transaction Service -- Prometheus scrape ------+--> Grafana
+Payment Service ------ OTLP traces ------------+--> Tempo --> Grafana
+Transaction Service -- OTLP traces ------------+
+```
 
 ## Security boundary
 
+Payment Service is a stateless OAuth2 Resource Server. It does not issue credentials.
+
 ```text
-OAuth2 / OIDC Provider
-        |
-        | publishes signing keys
-        v
-      JWKS
-        |
-        v
-Payment Service resource server
-        |
-        +-- verify JWT signature
-        +-- validate issuer
-        +-- validate audience
-        +-- validate exp / timing
-        +-- validate subject
-        |
-        v
-OAuth scope authorization
-        |
-        +-- payments:write -> POST /api/v1/payments
-        +-- payments:read  -> GET  /api/v1/payments/{id}
-        `-- ops:read       -> actuator metrics / prometheus
-        |
-        v
-JWT sub -> customer ownership identity
+JWT
+ |
+ +-- signature via JWKS
+ +-- issuer
+ +-- audience
+ +-- expiration/timing
+ +-- non-empty subject
+ |
+ v
+scope authorization
+ +-- payments:write -> POST /api/v1/payments
+ +-- payments:read  -> GET /api/v1/payments/{id}
+ `-- ops:read       -> metrics / Prometheus by default
 ```
 
-The service does not issue tokens. Credential issuance, login, MFA, refresh tokens, and authorization grants belong to the external identity provider. Payment Service only validates bearer access tokens and enforces authorization at its boundary.
+`/actuator/health`, `/actuator/info`, OpenAPI JSON/YAML, and Swagger UI remain public. `/actuator/prometheus` is protected by `ops:read` unless the explicit local-development setting `OBSERVABILITY_PUBLIC_PROMETHEUS=true` is enabled. That switch is intended only for the local unauthenticated Prometheus container.
 
-`/actuator/health` and `/actuator/info` remain public so infrastructure can probe the service without application credentials. Metrics and Prometheus endpoints require `ops:read` because they can reveal operational information.
-
-## API contract boundary
+## Customer-scoped idempotency
 
 ```text
-PaymentController + request/response models + validation annotations
-                           |
-                           v
-                    springdoc OpenAPI
-                           |
-              +------------+------------+
-              |                         |
-              v                         v
-        /v3/api-docs              /swagger-ui.html
-              |                         |
-              +-----------+-------------+
-                          |
-                          v
-              clients / developers / tooling
-```
-
-The OpenAPI surface is intentionally readable without authentication because the contract contains interface metadata, not payment data. Swagger UI can accept a bearer token for interactive requests, but the UI itself does not bypass Spring Security: calls to the payment endpoints still require the same JWT scopes and ownership checks as any other client.
-
-The contract defines a JWT bearer security scheme and documents operation-specific scope requirements in the endpoint descriptions. Request and response schemas carry examples and validation semantics. The injected Spring Security `Jwt` principal is hidden from the generated operation parameters because it is server-side context, not client input.
-
-Payment-create documentation explicitly exposes the required `Idempotency-Key` header and the customer-scoped retry semantics. Error documentation distinguishes malformed input (`400`), missing/invalid authentication (`401`), insufficient scope (`403`), ownership/not-found behavior (`404`), and conflicting idempotent retries (`409`).
-
-## Customer ownership and request idempotency
-
-```text
-POST /api/v1/payments
-Bearer JWT sub = customer-A
+JWT sub = customer-A
 Idempotency-Key = checkout-42
         |
         v
-Redis key = SHA-256(customer-A + separator + checkout-42)
-        |
-        +-- hit --> compare amount/currency --> return / 409
-        |
-        `-- miss
-             |
-             v
-PostgreSQL lookup
-WHERE customer_id = customer-A
-  AND idempotency_key = checkout-42
-             |
-             +-- existing --> compare --> return / 409
-             |
-             `-- absent
-                  |
-                  v
+Redis hashed customer/key namespace
+  |-- hit --> compare original request --> return / 409
+  `-- miss
+       |
+       v
+PostgreSQL WHERE customer_id = customer-A
+              AND idempotency_key = checkout-42
+       |-- existing --> compare --> return / 409
+       `-- absent
+            |
+            v
 INSERT ... ON CONFLICT (customer_id, idempotency_key) DO NOTHING
 ```
 
-This avoids both failure modes of a global idempotency key: one customer cannot collide with another customer's retry key, and cached results cannot leak across customer boundaries. Two customers may use the same textual key and receive independent payments.
+Two customers may use the same textual idempotency key independently. For one customer, reusing a key with a different amount or currency returns `409 Conflict`.
 
-For one customer, the key remains bound to the original payment semantics. Reusing it with a different amount or currency returns `409 Conflict`.
-
-## Transactional outbox and multi-instance claiming
+## Transactional outbox
 
 ```text
 payment transaction
@@ -118,92 +102,98 @@ payment transaction
   `-- PENDING outbox row
           |
           v
-relay claim transaction
-  SELECT eligible rows
+claim transaction
+  SELECT claimable rows
   FOR UPDATE SKIP LOCKED
-  mark PROCESSING
-  set claimed_at
-  increment attempts
+  mark PROCESSING + claimed_at
 COMMIT
           |
           v
-Kafka send outside DB transaction
-    |
-    +-- success --> PUBLISHED
-    `-- failure --> PENDING + backoff + last_error
-                         |
-                         `-- attempts exhausted --> FAILED
+Kafka I/O outside DB lock
+  |-- success --> PUBLISHED
+  `-- failure --> bounded backoff --> FAILED after max attempts
 ```
 
-`SKIP LOCKED` lets multiple Payment Service instances poll concurrently without waiting on the same rows. A stale `PROCESSING` lease becomes claimable again if an instance dies after claiming. Kafka I/O remains outside the claim transaction so broker latency does not hold database locks open.
+The relay is intentionally **at least once**. A crash after Kafka acknowledges a send but before PostgreSQL records `PUBLISHED` can produce redelivery, so Transaction Service deduplicates using the immutable event ID and durable `processed_events` state.
 
-The delivery guarantee is at-least-once. If Kafka accepts an event and the process dies before PostgreSQL records `PUBLISHED`, the event can be sent again. Consumer idempotency is therefore part of the architecture, not an optional optimization.
-
-## Consumer failure flow
+## Consumer recovery
 
 ```text
 payments.created.v1
         |
         v
 Transaction Service
-        |
-        +-- success ----------------------> commit offset
-        |
-        +-- retryable failure
-        |      +--> retry 1 (1s)
-        |      +--> retry 2 (1s)
-        |      `--> payments.created.v1.DLT
-        |
-        `-- malformed payload ------------> payments.created.v1.DLT
+  |-- new event ------> transaction + processed_events
+  |-- duplicate -----> no duplicate business write
+  |-- retryable -----> retry 1 -> retry 2 -> DLT
+  `-- malformed -----> DLT without useless retries
 ```
 
-Transaction Service stores the immutable event ID in `processed_events`. The business transaction row and processed-event marker commit together, with database uniqueness constraints providing an additional duplicate-write guard.
+## API contract boundary
 
-## Service data ownership
+springdoc derives the Payment Service OpenAPI document from controller metadata, validation constraints, schemas, and explicit operation annotations. The contract documents bearer authentication, scopes, `Idempotency-Key`, ownership semantics, examples, and the `400 / 401 / 403 / 404 / 409` response model. Integration tests inspect `/v3/api-docs` to catch contract drift.
 
-Payment Service owns the payment PostgreSQL database on local port `5432`. Transaction Service owns a separate PostgreSQL database on local port `5433`. Neither service reads the other's tables; Kafka is the integration boundary.
+## Observability plane
 
-Within Payment Service, authenticated customer identity is enforced in repository queries. Redis is shared infrastructure but contains only an optimization of the customer-scoped idempotency result; PostgreSQL remains authoritative.
+### Metrics
 
-## Container-backed verification
+Both services use Micrometer and the Prometheus registry. Common `application` and `environment` tags make multi-service queries explicit.
 
-The Maven suite exercises real Redis, PostgreSQL, and Kafka dependencies through Testcontainers and runs HTTP authorization checks through Spring Security's filter chain.
+Payment Service domain metrics:
 
-### Payment Service verification
+- `payments.outbox.events` with `status=pending|processing|failed`
+- `payments.outbox.publish.events` with `outcome=success|failure`
+- `payments.outbox.publish.latency`
 
-The suite verifies:
+Transaction Service domain metrics:
 
-- two simultaneous same-customer/same-key creates resolve to one payment and one outbox event;
-- different customers can independently reuse the same textual idempotency key;
-- same-customer/same-key/different-body requests return an idempotency conflict;
-- rolled-back work does not populate Redis;
-- the Flyway migration changes uniqueness to `(customer_id, idempotency_key)`;
-- the native `FOR UPDATE SKIP LOCKED` claim query executes against PostgreSQL;
-- unauthenticated payment creation receives `401`;
-- authenticated requests with the wrong scope receive `403`;
-- the JWT subject overrides/ignores spoofed customer identity in JSON;
-- payment reads enforce ownership and return `404` to other customers;
-- health is public while metrics require `ops:read`;
-- the OpenAPI endpoint is public;
-- the generated document includes the bearer scheme, payment paths, idempotency header, success/error responses, and operation security requirement;
-- the Swagger UI entry point is public.
+- `transactions.payment.events` with `outcome=received|created|duplicate|malformed`
+- `transactions.payment.processing.latency` with `outcome=created|duplicate`
+- `transactions.kafka.dlt`
 
-The MockMvc JWT tests exercise the authorization/filter-chain behavior without contacting an external identity provider. Production token signature and claim validation are provided by the configured Nimbus JWT decoder using the provider's JWKS, issuer, and audience settings.
+Framework telemetry includes HTTP server metrics, JVM/runtime metrics, datasource instrumentation, and Kafka observations. Histograms are enabled for the latency series used in p95 dashboard queries.
 
-### Transaction Service verification
+### Tracing
 
-A real Apache Kafka broker and PostgreSQL database verify duplicate delivery produces exactly one business transaction and malformed JSON reaches `payments.created.v1.DLT`.
+Both services include Spring Boot OpenTelemetry support. Trace export is opt-in through:
 
-## Security configuration contract
+```text
+OTEL_TRACING_ENABLED=true
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+TRACING_SAMPLING_PROBABILITY=1.0
+```
 
-Production environments must provide:
+Tempo receives OTLP HTTP traces locally. Grafana is provisioned with Tempo and Prometheus data sources.
 
-- `JWT_ISSUER_URI` — expected token issuer
-- `JWT_AUDIENCE` — required audience, default logical API name `payment-api`
-- `JWT_JWK_SET_URI` — provider JWKS endpoint used for signature verification
+### Important outbox trace boundary
 
-The values checked into `application.yml` are development placeholders and are not credentials.
+The transactional outbox currently stores the business event payload but **does not persist the original HTTP trace context**. The original payment request therefore commits before a later scheduled relay starts publishing the outbox event. Kafka observation can propagate context from the relay-produced record to Transaction Service, but that relay trace should not be presented as a continuous child of the earlier HTTP request.
 
-## Next milestones
+Persisting W3C trace context alongside the outbox record would be a separate future design choice. Keeping this limitation explicit avoids misleading trace topology.
 
-The main remaining platform work is richer OpenTelemetry/Prometheus/Grafana observability, operational DLT replay, and deployment infrastructure such as Kubernetes/Helm and AWS architecture.
+## Local observability profile
+
+`docker compose --profile observability up -d` provisions:
+
+- Prometheus on `localhost:9090`
+- Grafana on `localhost:3000`
+- Tempo query/API on `localhost:3200`
+- Tempo OTLP HTTP receiver on `localhost:4318`
+
+Grafana automatically loads Prometheus and Tempo data sources plus the `Event-Driven Payment Platform` dashboard. Anonymous admin access exists only in this developer profile.
+
+## Verification
+
+CI performs three layers of verification:
+
+1. `docker compose --profile observability config` validates the composed infrastructure definition.
+2. Python parses the provisioned Grafana dashboard JSON.
+3. `mvn --batch-mode test` runs the full unit and Testcontainers suite.
+
+The Payment Service integration suite also requests `/actuator/prometheus` through the Spring Security filter chain with `ops:read` and checks that the custom outbox metric family is present.
+
+The existing PostgreSQL/Redis tests continue to cover concurrent idempotency, rollback behavior, customer isolation, outbox claiming, security, and OpenAPI. Transaction Service continues to use real Kafka + PostgreSQL to verify duplicate delivery and DLT behavior.
+
+## Remaining platform work
+
+The next high-value milestones are an operational DLT replay/recovery workflow, service expansion (notification/audit), Kubernetes/Helm deployment definitions, and an AWS deployment architecture.

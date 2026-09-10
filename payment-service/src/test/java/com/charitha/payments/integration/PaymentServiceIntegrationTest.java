@@ -35,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -43,6 +44,7 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 import static org.springframework.security.test.web.servlet.setup.SecurityMockMvcConfigurers.springSecurity;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -261,6 +263,16 @@ class PaymentServiceIntegrationTest {
                                 .jwt(token -> token.subject("operator-1"))
                                 .authorities(new SimpleGrantedAuthority("SCOPE_ops:read"))))
                 .andExpect(status().isOk());
+    }
+
+    @Test
+    void prometheusEndpointExposesOutboxMetricsToOpsScope() throws Exception {
+        mockMvc.perform(get("/actuator/prometheus")
+                        .with(jwt()
+                                .jwt(token -> token.subject("operator-1"))
+                                .authorities(new SimpleGrantedAuthority("SCOPE_ops:read"))))
+                .andExpect(status().isOk())
+                .andExpect(content().string(containsString("payments_outbox_events")));
     }
 
     @Test

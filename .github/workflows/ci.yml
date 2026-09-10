@@ -15,5 +15,9 @@ jobs:
           distribution: temurin
           java-version: '17'
           cache: maven
+      - name: Validate observability configuration
+        run: |
+          docker compose --profile observability config >/dev/null
+          python -m json.tool observability/grafana/dashboards/payment-platform.json >/dev/null
       - name: Run tests
         run: mvn --batch-mode test

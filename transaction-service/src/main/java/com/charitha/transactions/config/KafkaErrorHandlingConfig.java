@@ -1,9 +1,11 @@
 package com.charitha.transactions.config;
 
+import com.charitha.transactions.observability.TransactionConsumerMetrics;
 import org.apache.kafka.common.TopicPartition;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.ConsumerRecordRecoverer;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.util.backoff.FixedBackOff;
@@ -26,10 +28,17 @@ public class KafkaErrorHandlingConfig {
     }
 
     @Bean
-    DefaultErrorHandler kafkaErrorHandler(DeadLetterPublishingRecoverer recoverer) {
+    DefaultErrorHandler kafkaErrorHandler(
+            DeadLetterPublishingRecoverer recoverer,
+            TransactionConsumerMetrics metrics) {
+        ConsumerRecordRecoverer observedRecoverer = (record, exception) -> {
+            recoverer.accept(record, exception);
+            metrics.recordDltPublished();
+        };
+
         // Original delivery + 2 retries = 3 total attempts for retryable failures.
         DefaultErrorHandler errorHandler = new DefaultErrorHandler(
-                recoverer,
+                observedRecoverer,
                 new FixedBackOff(1_000L, 2L)
         );
 
