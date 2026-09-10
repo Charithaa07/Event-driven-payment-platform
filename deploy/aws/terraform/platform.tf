@@ -31,6 +31,17 @@ resource "aws_cloudwatch_log_group" "eks" {
   retention_in_days = 30
 }
 
+resource "aws_kms_key" "eks_secrets" {
+  description             = "Envelope encryption for Kubernetes Secrets in ${local.name}"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+}
+
+resource "aws_kms_alias" "eks_secrets" {
+  name          = "alias/${local.name}-eks-secrets"
+  target_key_id = aws_kms_key.eks_secrets.key_id
+}
+
 resource "aws_iam_role" "eks_cluster" {
   name = "${local.name}-eks-cluster"
   assume_role_policy = jsonencode({
@@ -59,11 +70,17 @@ resource "aws_eks_cluster" "main" {
     authentication_mode = "API_AND_CONFIG_MAP"
   }
 
+  encryption_config {
+    provider {
+      key_arn = aws_kms_key.eks_secrets.arn
+    }
+    resources = ["secrets"]
+  }
+
   vpc_config {
     subnet_ids              = aws_subnet.private[*].id
     endpoint_private_access = true
-    endpoint_public_access  = true
-    public_access_cidrs     = var.eks_public_access_cidrs
+    endpoint_public_access  = false
   }
 
   depends_on = [

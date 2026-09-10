@@ -1,0 +1,192 @@
+name: Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '27 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    name: CodeQL Java
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java-kotlin
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze Java source
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:java-kotlin
+
+  supply-chain:
+    name: Supply-chain and image security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      TRIVY_IMAGE: aquasec/trivy:0.74.0
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Package services and populate Maven dependency cache
+        run: |
+          mvn --batch-mode -DskipTests package
+          mvn --batch-mode -DskipTests dependency:resolve
+          mkdir -p "$RUNNER_TEMP/trivy-cache" security-reports
+
+      - name: Generate aggregate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          mvn --batch-mode \
+            org.cyclonedx:cyclonedx-maven-plugin:2.9.3:makeAggregateBom \
+            -DoutputFormat=json \
+            -DoutputName=platform-sbom
+          test -f target/platform-sbom.json
+          cp target/platform-sbom.json security-reports/platform-sbom.cdx.json
+
+      - name: Scan repository for committed secrets
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -v "$HOME/.m2:/root/.m2:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" fs \
+            --scanners secret \
+            --offline-scan \
+            --exit-code 1 \
+            --no-progress \
+            .
+
+      - name: Scan Terraform and Kubernetes configuration
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" fs \
+            --scanners misconfig \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --no-progress \
+            deploy
+
+      - name: Gate fixed critical Java dependency vulnerabilities
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -v "$HOME/.m2:/root/.m2:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" fs \
+            --scanners vuln \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            --offline-scan \
+            --exit-code 1 \
+            --no-progress \
+            .
+
+      - name: Produce repository SARIF report
+        if: always()
+        run: |
+          mkdir -p security-reports
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace \
+            -v "$HOME/.m2:/root/.m2:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" fs \
+            --scanners vuln,misconfig,secret \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --offline-scan \
+            --format sarif \
+            --output security-reports/trivy-repository.sarif \
+            --no-progress \
+            .
+
+      - name: Upload repository scan to code scanning
+        if: always() && hashFiles('security-reports/trivy-repository.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: security-reports/trivy-repository.sarif
+          category: trivy-repository
+
+      - name: Build, scan, and inventory runtime images
+        run: |
+          set -euo pipefail
+          mkdir -p security-reports/images
+
+          while IFS=: read -r service port; do
+            jar_file=$(find "$service/target" -maxdepth 1 -type f -name "$service-*.jar" ! -name "*.original" | head -n 1)
+            test -n "$jar_file"
+            image="payment-platform/$service:security-${GITHUB_SHA}"
+
+            docker build \
+              --build-arg JAR_FILE="$jar_file" \
+              --build-arg SERVICE_PORT="$port" \
+              -t "$image" .
+
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              "$TRIVY_IMAGE" image \
+              --scanners vuln \
+              --severity CRITICAL \
+              --ignore-unfixed \
+              --offline-scan \
+              --exit-code 1 \
+              --no-progress \
+              "$image"
+
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$PWD:/workspace" -w /workspace \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+              "$TRIVY_IMAGE" image \
+              --format cyclonedx \
+              --output "security-reports/images/${service}.cdx.json" \
+              --offline-scan \
+              --no-progress \
+              "$image"
+          done <<'EOF'
+          payment-service:8080
+          transaction-service:8081
+          audit-service:8082
+          notification-service:8083
+          EOF
+
+      - name: Upload security evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-evidence-${{ github.sha }}
+          path: security-reports/
+          if-no-files-found: warn
+          retention-days: 14

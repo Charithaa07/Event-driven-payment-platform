@@ -1,6 +1,6 @@
 # AWS production reference architecture
 
-Phase 14 maps the Kubernetes-ready payment platform onto managed AWS infrastructure without changing the application's correctness semantics. Terraform describes the cloud resources; Helm remains the application deployment boundary; and the AWS deployment workflow is deliberately manual so merging code never creates billable infrastructure or changes a live environment automatically.
+Phase 14 maps the Kubernetes-ready payment platform onto managed AWS infrastructure without changing the application's correctness semantics. Phase 16 hardens that reference architecture with a private-only EKS control plane, customer-managed KMS envelope encryption for Kubernetes Secrets, restricted managed-service security groups, and a private deployment-runner boundary. Terraform describes the cloud resources; Helm remains the application deployment boundary; and the AWS deployment workflow is deliberately manual so merging code never creates billable infrastructure or changes a live environment automatically.
 
 > The repository contains a validated AWS reference implementation and deployment workflow. It does **not** mean an AWS account has already been provisioned or that these services are currently running in AWS.
 
@@ -9,16 +9,19 @@ Phase 14 maps the Kubernetes-ready payment platform onto managed AWS infrastruct
 ```text
 GitHub Actions
     |
-    | OIDC -> short-lived AWS role
+    | workflow_dispatch + protected environment
     v
-Amazon ECR ------------------------------+
-    |                                    |
-    | immutable images                   |
-    v                                    |
-Amazon EKS (private application subnets) |
-    |                                    |
-    +-- Payment Service -----------------+--> RDS PostgreSQL (payments)
-    |       |                                 ElastiCache Serverless Redis
+Private self-hosted deployment runner (VPC reachable)
+    |
+    | OIDC -> short-lived AWS role
+    +---------------------> Amazon ECR
+    |
+    | private EKS API
+    v
+Amazon EKS (private application subnets)
+    |
+    +-- Payment Service --------------------> RDS PostgreSQL (payments)
+    |       |                                  ElastiCache Serverless Redis
     |       +--> MSK Serverless (IAM)
     |
     +-- Transaction Service ----------------> RDS PostgreSQL (transactions)
@@ -36,16 +39,17 @@ Each workload ServiceAccount
     -> least-privilege MSK permissions
 ```
 
-The VPC spans two Availability Zones. Application nodes, RDS, MSK, and ElastiCache use private subnets. Two NAT gateways provide AZ-local outbound access for private workloads. Public subnets are reserved for internet-facing load-balancer infrastructure when enabled.
+The VPC spans two Availability Zones. Application nodes, RDS, MSK, and ElastiCache use private subnets. Two NAT gateways provide AZ-local outbound access for private workloads. Public subnets are reserved for explicitly public infrastructure such as NAT gateways or a future internet-facing load balancer; subnet-level automatic public-IP assignment is disabled.
 
 ## What Terraform provisions
 
 `deploy/aws/terraform` contains the production reference infrastructure:
 
 - a two-AZ VPC with public/private subnets, Internet Gateway, two NAT gateways, routing, and security groups;
-- an Amazon EKS cluster and managed node group;
+- an Amazon EKS cluster with a private-only Kubernetes API endpoint and managed node group;
+- customer-managed KMS envelope encryption for Kubernetes Secrets with automatic key rotation;
 - EKS control-plane logging to CloudWatch;
-- the VPC CNI, CoreDNS, kube-proxy, and EKS Pod Identity Agent add-ons;
+- the VPC CNI, CoreDNS, kube-proxy, EKS Pod Identity Agent, and Metrics Server add-ons;
 - four immutable Amazon ECR repositories with scan-on-push and lifecycle retention;
 - four independent Amazon RDS for PostgreSQL instances, one per service-owned datastore;
 - RDS-managed master credentials in AWS Secrets Manager;
@@ -56,6 +60,27 @@ The VPC spans two Availability Zones. Application nodes, RDS, MSK, and ElastiCac
 - namespace-scoped EKS access for the deployment role.
 
 The application chart intentionally does not deploy PostgreSQL, Kafka, or Redis into EKS. Those stateful dependencies remain managed AWS services.
+
+## Network security boundary
+
+The Kubernetes API endpoint is private-only:
+
+```text
+endpoint_private_access = true
+endpoint_public_access  = false
+```
+
+This deliberately means a stock GitHub-hosted Actions runner cannot administer the cluster. The production deployment job is therefore pinned to a self-hosted runner with the label `payment-platform-deploy` and network reachability to the VPC/private EKS API. Opening the control plane to `0.0.0.0/0` merely to make a hosted runner convenient is not part of this reference architecture.
+
+The RDS, MSK, and Redis security groups accept only their application protocol from the platform VPC and do not define unrestricted outbound rules. Security groups are stateful, so return traffic for established inbound connections is still allowed without a general `0.0.0.0/0` egress rule on those managed-service groups.
+
+Public subnets retain their route to the Internet Gateway for NAT gateways and possible future load-balancer infrastructure, but `map_public_ip_on_launch` is disabled. A resource that truly needs a public address must receive one explicitly.
+
+## EKS secret encryption
+
+The EKS cluster uses a dedicated customer-managed KMS key for Kubernetes Secret envelope encryption. Terraform enables KMS key rotation and configures the EKS `encryption_config` for the `secrets` resource.
+
+This complements, rather than replaces, the existing application secret boundaries. Database passwords continue to originate from RDS-managed Secrets Manager secrets; the Kubernetes Secret is only the runtime handoff expected by the current Helm chart.
 
 ## Identity boundaries
 
@@ -70,6 +95,8 @@ repo:Charithaa07/Event-driven-payment-platform:environment:production
 ```
 
 Use a protected GitHub `production` Environment with required reviewers before enabling real deployments.
+
+The self-hosted runner is a network execution boundary, not an AWS credential store. It still obtains short-lived credentials through GitHub OIDC. Because this is a public repository, do not expose the private runner to arbitrary pull-request jobs; the AWS deployment workflow is manual, checks out `main`, and requires the protected production Environment.
 
 ### EKS workload -> AWS
 
@@ -124,7 +151,7 @@ Payment Service continues to treat Redis as an idempotency optimization rather t
 
 `values-aws.yaml` is prepared for the AWS Load Balancer Controller (`ingress.class=alb`) but leaves Ingress disabled by default.
 
-The current Terraform stack does **not** install the AWS Load Balancer Controller or create a public ALB. Install/configure the controller separately and enable the chart Ingress only after DNS/TLS and exposure requirements are decided. This keeps the Phase 14 infrastructure from pretending that an Internet-facing endpoint exists when it has not been provisioned.
+The current Terraform stack does **not** install the AWS Load Balancer Controller or create a public ALB. Install/configure the controller separately and enable the chart Ingress only after DNS/TLS and exposure requirements are decided. This keeps the infrastructure from pretending that an Internet-facing endpoint exists when it has not been provisioned.
 
 ## Observability on AWS
 
@@ -140,7 +167,7 @@ A later production hardening pass can add Amazon Managed Service for Prometheus/
 
 ## Terraform workflow
 
-The configuration pins Terraform and the AWS provider in `versions.tf`. CI runs formatting, initialization without a remote backend, and provider-schema validation without requiring AWS credentials:
+The configuration pins Terraform and the AWS provider in `versions.tf`. CI runs formatting, initialization without a remote backend, provider-schema validation, and Phase 16 security scanning without requiring AWS credentials:
 
 ```bash
 terraform -chdir=deploy/aws/terraform fmt -check -diff -recursive
@@ -166,7 +193,9 @@ terraform -chdir=deploy/aws/terraform plan -out=prod.tfplan
 terraform -chdir=deploy/aws/terraform apply prod.tfplan
 ```
 
-Do not apply this example blindly. EKS, NAT gateways, four RDS instances, MSK Serverless, and ElastiCache are billable AWS resources.
+Because the EKS API is private-only, the operator applying or administering the cluster must have network reachability into the VPC when Kubernetes API access is required. Terraform can create the cluster control plane through the AWS API without `kubectl`, but subsequent Kubernetes deployment operations require the private network path.
+
+Do not apply this example blindly. EKS, NAT gateways, four RDS instances, MSK Serverless, ElastiCache, and KMS are billable AWS resources.
 
 ## Required GitHub Environment variables
 
@@ -182,15 +211,27 @@ JWT_JWK_SET_URI
 
 `AWS_DEPLOY_ROLE_ARN`, cluster name, ECR URLs, RDS endpoints/secret ARNs, and workload-role ARNs are available as Terraform outputs.
 
+## Private deployment runner prerequisite
+
+Before using `.github/workflows/aws-deploy.yml`, register a hardened self-hosted runner that has all of the following:
+
+- labels `self-hosted`, `linux`, `x64`, and `payment-platform-deploy`;
+- network reachability to the EKS private API endpoint, normally from a private subnet or connected management network;
+- outbound HTTPS access for GitHub Actions and package/image registries as required;
+- Docker, AWS CLI v2, `kubectl`, `jq`, and Maven installed;
+- no long-lived AWS deployment keys on disk.
+
+The workflow verifies those required command-line tools before obtaining its short-lived AWS role. Treat the runner as privileged production infrastructure: patch it, isolate it, do not use it for untrusted PR code, and prefer ephemeral runner lifecycle when implementing this architecture for a real environment.
+
 ## Application deployment
 
-The workflow `.github/workflows/aws-deploy.yml` is `workflow_dispatch` only. It:
+The workflow `.github/workflows/aws-deploy.yml` is `workflow_dispatch` only and runs on the private `payment-platform-deploy` runner. It:
 
 1. obtains short-lived AWS credentials through GitHub OIDC;
 2. packages the four Spring Boot applications;
 3. builds four hardened runtime images;
 4. pushes an immutable commit-SHA (or explicitly supplied) tag to ECR;
-5. configures `kubectl` for EKS;
+5. configures `kubectl` for the private EKS API;
 6. discovers RDS, MSK, and ElastiCache endpoints;
 7. reads the RDS-managed credentials from Secrets Manager and creates/updates the Kubernetes Secret;
 8. deploys the AWS Helm profile with exact image tags and managed-service endpoints;
