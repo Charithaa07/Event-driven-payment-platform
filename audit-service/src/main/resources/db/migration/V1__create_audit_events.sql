@@ -8,7 +8,7 @@ CREATE TABLE audit_events (
     source_partition INTEGER NOT NULL,
     source_offset BIGINT NOT NULL,
     payload TEXT NOT NULL,
-    record_sha256 CHAR(64) NOT NULL,
+    record_sha256 VARCHAR(64) NOT NULL,
     occurred_at TIMESTAMPTZ NOT NULL,
     recorded_at TIMESTAMPTZ NOT NULL,
     CONSTRAINT uq_audit_source_position UNIQUE (source_topic, source_partition, source_offset)
