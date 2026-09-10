@@ -1,8 +1,8 @@
 # Event-Driven Payment Platform
 
-A portfolio-grade payment backend built to demonstrate production concerns beyond CRUD: **authenticated APIs, concurrency-safe idempotency, transactional messaging, at-least-once delivery, consumer deduplication, bounded recovery, operational replay, immutable audit evidence, executable API contracts, metrics, and distributed tracing**.
+A portfolio-grade payment backend built to demonstrate production concerns beyond CRUD: **authenticated APIs, concurrency-safe idempotency, transactional messaging, at-least-once delivery, consumer deduplication, bounded recovery, operational replay, immutable audit evidence, asynchronous provider delivery, executable API contracts, metrics, and distributed tracing**.
 
-> Status: **Phase 11** — Payment, Transaction, and Audit services now run as independent Spring Boot services with separate datastores. The platform includes transactional outbox delivery, idempotent processing, durable DLT recovery, OAuth2/JWT authorization, OpenAPI, Prometheus/OpenTelemetry observability, and an append-only audit trail for payment-created events.
+> Status: **Phase 12** — Payment, Transaction, Audit, and Notification services run as independent Spring Boot services with separate datastores. The platform includes transactional outbox delivery, idempotent processing, durable DLT recovery, OAuth2/JWT authorization, OpenAPI, Prometheus/OpenTelemetry observability, append-only audit evidence, and leased/retryable asynchronous notification delivery.
 
 ## Architecture
 
@@ -11,6 +11,7 @@ flowchart LR
     IDP[OAuth2 / OIDC Provider] -->|JWKS| P[Payment Service]
     IDP -->|JWKS| T[Transaction Service]
     IDP -->|JWKS| A[Audit Service]
+    IDP -->|JWKS| N[Notification Service]
     C[Client] -->|Bearer JWT + REST| P
     P --> R[(Redis)]
     P --> PG[(Payment PostgreSQL)]
@@ -19,6 +20,7 @@ flowchart LR
     RLY --> K[(Kafka)]
     K --> T
     K --> A
+    K --> N
     T --> TG[(Transaction PostgreSQL)]
     T --> PE[(Processed Events)]
     T --> DLT[payments.created.v1.DLT]
@@ -29,10 +31,16 @@ flowchart LR
     A --> AG[(Audit PostgreSQL)]
     AUD[Auditor] -->|audit:read| A
     A --> ADLT[payments.created.v1.audit.DLT]
+    N --> NG[(Notification PostgreSQL)]
+    N --> DISP[Leased Dispatcher]
+    DISP --> NP[Notification Provider]
+    N --> NDLT[payments.created.v1.notification.DLT]
+    NOPS[Notification Operator] -->|notification:read| N
 
     P -. metrics / traces .-> OBS[Prometheus + Tempo]
     T -. metrics / traces .-> OBS
     A -. metrics / traces .-> OBS
+    N -. metrics / traces .-> OBS
     OBS --> G[Grafana]
 ```
 
@@ -49,11 +57,14 @@ flowchart LR
 - Separate Transaction Service datastore with durable `processed_events` idempotency
 - Bounded Kafka retries plus durable DLT indexing and secured operational replay
 - **Separate Audit Service datastore** consuming `payments.created.v1` independently
-- Audit records deduplicated by immutable event ID and Kafka source position
-- **Database-enforced append-only audit table**: PostgreSQL rejects UPDATE and DELETE operations
-- SHA-256 integrity digest over immutable event metadata + original payload, verified on detail reads
-- Read-only audit timeline/detail API protected by `audit:read`
-- Malformed audit-consumer records isolated to `payments.created.v1.audit.DLT`
+- Database-enforced append-only audit records with SHA-256 integrity verification
+- **Separate Notification Service datastore** with idempotent event ingestion and durable delivery state
+- Provider calls run outside Kafka listener/database claim transactions so slow external delivery does not stall ingestion
+- Notification dispatcher uses `FOR UPDATE SKIP LOCKED` plus processing leases for multi-instance claiming and crash recovery
+- Retryable provider failures use bounded exponential backoff; permanent failures terminate immediately
+- Stable notification IDs are passed as provider idempotency keys so a real provider integration can deduplicate a crash-after-send retry
+- Malformed notification-consumer records are isolated to `payments.created.v1.notification.DLT`
+- Read-only notification delivery API protected by `notification:read`
 - Runtime-generated **OpenAPI + Swagger UI** for externally queryable service APIs
 - **Prometheus + Micrometer** metrics and **OpenTelemetry/OTLP** tracing
 - Provisioned **Prometheus + Grafana + Tempo** local observability profile
@@ -91,37 +102,47 @@ The DLT is indexed durably for operations. `ops:read` allows inspection and `ops
 
 ## Immutable Audit Service
 
-Audit Service consumes the same `payments.created.v1` stream using its own consumer group, so audit ingestion is independent of Transaction Service business processing.
+Audit Service consumes the same `payments.created.v1` stream using its own consumer group, so audit ingestion is independent of Transaction Service business processing. `event_id` is the logical idempotency key, Kafka source position is independently unique, and PostgreSQL rejects `UPDATE` and `DELETE` on `audit_events`. Detail reads recompute the stored SHA-256 integrity digest.
+
+## Asynchronous Notification Service
+
+Notification Service consumes `payments.created.v1` with its own consumer group and converts each logical payment event into one durable EMAIL delivery request. The unique `(source_event_id, channel)` constraint makes replayed logical events idempotent.
 
 ```text
 payments.created.v1
         |
-        +------------------------------+
-        |                              |
-        v                              v
-Transaction Service              Audit Service
-business state                   append-only evidence
-        |                              |
-        v                              v
-Transaction DB                    Audit DB
-                               event_id PK
-                               Kafka topic/partition/offset
-                               aggregate/customer identity
-                               original JSON payload
-                               SHA-256 record digest
-                               occurred_at / recorded_at
+        v
+Notification consumer
+        |
+        | INSERT ... ON CONFLICT DO NOTHING
+        v
+Notification DB: PENDING
+        |
+        v
+FOR UPDATE SKIP LOCKED claim
+        |
+        | commit short DB transaction
+        v
+Provider call outside DB transaction
+   | success
+   +----------> SENT
+   |
+   | retryable failure
+   +----------> RETRY_PENDING + exponential backoff
+   |
+   ` permanent / attempts exhausted
+              -> FAILED
 ```
 
-### Audit correctness boundaries
+### Delivery correctness boundaries
 
-- `event_id` is the logical idempotency key; replaying the same business event does not create a second audit row.
-- `(source_topic, source_partition, source_offset)` is also unique, protecting against repeated delivery of the same Kafka record.
-- `record_sha256` covers event ID, event type, payment aggregate ID, customer ID, Kafka source position, and the original payload.
-- A PostgreSQL trigger rejects `UPDATE` and `DELETE` against `audit_events`, making append-only behavior a database invariant rather than a controller convention.
-- Timeline responses omit the raw payload; event-detail responses include it and report `integrityValid` after recomputing the digest.
-- Invalid audit payloads do not poison the primary consumer indefinitely; they are sent to `payments.created.v1.audit.DLT`.
-
-This phase intentionally audits **payment-created events**. Additional lifecycle topics can be added later without coupling Audit Service to another service's database.
+- Kafka ingestion and external provider delivery are intentionally decoupled. A slow provider cannot hold the Kafka listener open.
+- Dispatchers claim work using row locks with `SKIP LOCKED`, then commit before calling the provider. This keeps database lock duration short and allows multiple service instances to share the queue safely.
+- A `PROCESSING` lease lets another instance reclaim work after a crashed dispatcher.
+- Retryable failures are bounded by `max-attempts` and exponential backoff; permanent provider failures skip pointless retries.
+- A crash can occur after the provider accepts a message but before `SENT` is persisted. The same stable notification ID is therefore supplied as an idempotency key to the provider abstraction. End-to-end exactly-once delivery is **not** claimed; a production provider must honor that idempotency key or otherwise tolerate duplicate delivery.
+- The built-in `LoggingNotificationProvider` is a development adapter only. It demonstrates the provider boundary without pretending the repository sends real email or SMS.
+- Malformed source records move to `payments.created.v1.notification.DLT`. Provider delivery failures remain visible in durable notification state rather than being confused with Kafka ingestion failures.
 
 ## API and authorization
 
@@ -133,16 +154,18 @@ This phase intentionally audits **payment-created events**. Additional lifecycle
 | Transaction `POST /api/v1/operations/dlt/{eventId}/replay` | `ops:write` |
 | Audit `GET /api/v1/audit/payments/{paymentId}` | `audit:read` |
 | Audit `GET /api/v1/audit/events/{eventId}` | `audit:read` |
+| Notification `GET /api/v1/notifications/{notificationId}` | `notification:read` |
+| Notification `GET /api/v1/notifications?paymentId=...` | `notification:read` |
 | `/actuator/metrics/**` | `ops:read` |
 | `/actuator/prometheus` | `ops:read` by default |
 | `/actuator/health`, `/actuator/info` | public probe endpoints |
 | `/v3/api-docs`, `/swagger-ui.html` | public API documentation where enabled |
 
-Audit Service uses a logical JWT audience of `audit-api`, configurable with `AUDIT_JWT_AUDIENCE`. Transaction operational APIs use their own configured audience; Payment Service defaults to `payment-api`.
+Logical JWT audiences are independently configurable: `payment-api`, `transaction-ops-api`, `audit-api`, and `notification-api`.
 
 ## Observability
 
-All three services expose framework telemetry through Micrometer and can export traces over OTLP. Kafka producer/listener observation remains enabled.
+All four services expose framework telemetry through Micrometer and can export traces over OTLP. Kafka producer/listener observation remains enabled.
 
 Domain-specific metrics include:
 
@@ -152,12 +175,14 @@ Domain-specific metrics include:
 - `transactions.payment.events{outcome=...}`
 - `transactions.kafka.dlt*`
 - `audit.payment.events{outcome=received|stored|duplicate|malformed|dead_lettered}`
+- `notifications.ingestion.events{outcome=received|stored|duplicate|malformed|dead_lettered}`
+- `notifications.delivery.attempts{outcome=sent|retry_scheduled|failed}`
 
-Prometheus is configured to scrape local service ports `8080`, `8081`, and `8082`. The local `OBSERVABILITY_PUBLIC_PROMETHEUS=true` switch exists only for unauthenticated developer scraping; production/shared deployments should keep metrics protected.
+Prometheus is configured to scrape local service ports `8080` through `8083`. The local `OBSERVABILITY_PUBLIC_PROMETHEUS=true` switch exists only for unauthenticated developer scraping; production/shared deployments should keep metrics protected.
 
 ### Trace boundary
 
-The transactional outbox currently persists business payload but not the original HTTP W3C trace context. The HTTP request and later scheduled outbox-relay trace are therefore separate traces. Kafka observation can propagate the relay trace to downstream consumers, but the repository does not claim false HTTP-to-consumer continuity.
+The transactional outbox currently persists business payload but not the original HTTP W3C trace context. The HTTP request and later scheduled outbox-relay trace are therefore separate traces. Kafka observation can propagate the relay trace to downstream consumers. Provider dispatch runs later from durable notification state, so it is also a separate scheduled trace unless explicit trace context is persisted in a future phase.
 
 ## Run locally
 
@@ -170,11 +195,13 @@ export JWT_ISSUER_URI=https://issuer.example.com/
 export JWT_AUDIENCE=payment-api
 export TRANSACTION_JWT_AUDIENCE=transaction-ops-api
 export AUDIT_JWT_AUDIENCE=audit-api
+export NOTIFICATION_JWT_AUDIENCE=notification-api
 export JWT_JWK_SET_URI=https://issuer.example.com/.well-known/jwks.json
 
 mvn spring-boot:run -pl payment-service
 mvn spring-boot:run -pl transaction-service
 mvn spring-boot:run -pl audit-service
+mvn spring-boot:run -pl notification-service
 ```
 
 Service ports:
@@ -182,9 +209,11 @@ Service ports:
 - Payment Service: `8080`
 - Transaction Service: `8081`
 - Audit Service: `8082`
+- Notification Service: `8083`
 - Payment PostgreSQL: `5432`
 - Transaction PostgreSQL: `5433`
 - Audit PostgreSQL: `5434`
+- Notification PostgreSQL: `5435`
 
 Run all unit and container-backed integration tests:
 
@@ -209,7 +238,9 @@ Grafana is on `localhost:3000`, Prometheus on `localhost:9090`, and Tempo on `lo
 
 **Transaction Service:** Kafka + PostgreSQL tests cover duplicate delivery, DLT indexing, secured replay, repeat-replay safety, and operational scopes.
 
-**Audit Service:** Kafka + PostgreSQL tests verify logical duplicate events produce one record, stored hashes verify successfully, PostgreSQL rejects audit mutation, malformed records reach the audit DLT, audit query APIs enforce `audit:read`, timeline responses do not expose payloads, detail reads verify integrity, and OpenAPI remains public.
+**Audit Service:** Kafka + PostgreSQL tests verify logical duplicate events produce one record, stored hashes verify successfully, PostgreSQL rejects audit mutation, malformed records reach the audit DLT, audit query APIs enforce `audit:read`, and OpenAPI remains public.
+
+**Notification Service:** Kafka + PostgreSQL tests verify logical duplicate events create one delivery, retryable provider failure persists `RETRY_PENDING` and later reaches `SENT`, permanent provider failure reaches `FAILED` after one attempt, malformed records reach the notification DLT, delivery APIs enforce `notification:read`, and OpenAPI remains public.
 
 ## Roadmap
 
@@ -225,13 +256,17 @@ Grafana is on `localhost:3000`, Prometheus on `localhost:9090`, and Tempo on `lo
 - [x] OAuth2/JWT authentication and authorization
 - [x] OpenAPI + Swagger UI
 - [x] Prometheus + OpenTelemetry + Grafana/Tempo
-- [x] **Immutable Audit Service + dedicated PostgreSQL datastore**
+- [x] Immutable Audit Service + dedicated PostgreSQL datastore
 - [x] Audit event idempotency + SHA-256 integrity verification
 - [x] Database-enforced append-only audit records
+- [x] **Notification Service + dedicated PostgreSQL datastore**
+- [x] Idempotent notification ingestion + leased multi-instance dispatch
+- [x] Bounded provider retry/backoff + terminal delivery state
+- [x] Notification-specific Kafka DLT isolation
 - [x] PostgreSQL / Redis / Kafka Testcontainers verification
 - [x] GitHub Actions CI
-- [ ] Notification service
-- [ ] Expand audit ingestion to additional lifecycle topics
+- [ ] Expand audit ingestion to transaction/notification lifecycle topics
+- [ ] Real provider adapter with secret-managed credentials
 - [ ] Kubernetes manifests / Helm
 - [ ] AWS deployment architecture
 
@@ -243,7 +278,7 @@ Grafana is on `localhost:3000`, Prometheus on `localhost:9090`, and Tempo on `lo
 **Data:** PostgreSQL, Redis  
 **Messaging:** Apache Kafka  
 **Observability:** Micrometer, Prometheus, OpenTelemetry, OTLP, Tempo, Grafana, Spring Boot Actuator  
-**Testing:** JUnit, Mockito, Spring Security Test, Testcontainers  
+**Testing:** JUnit, Spring Security Test, Testcontainers  
 **Infrastructure:** Docker Compose, GitHub Actions
 
 ## Repository structure
@@ -253,9 +288,11 @@ event-driven-payment-platform/
 ├── payment-service/
 ├── transaction-service/
 ├── audit-service/
-│   └── src/main/java/com/charitha/audit/
+├── notification-service/
+│   └── src/main/java/com/charitha/notifications/
 │       ├── api/
 │       ├── config/
+│       ├── delivery/
 │       ├── domain/
 │       ├── messaging/
 │       ├── observability/
