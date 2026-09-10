@@ -21,26 +21,37 @@ import org.springframework.security.web.SecurityFilterChain;
 public class SecurityConfig {
 
     @Bean
-    SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    SecurityFilterChain securityFilterChain(
+            HttpSecurity http,
+            @Value("${security.observability.public-prometheus:false}") boolean publicPrometheus) throws Exception {
         http
                 .csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                .authorizeHttpRequests(authorize -> authorize
-                        .requestMatchers(
-                                "/actuator/health",
-                                "/actuator/health/**",
-                                "/actuator/info",
-                                "/v3/api-docs/**",
-                                "/swagger-ui.html",
-                                "/swagger-ui/**",
-                                "/error"
-                        ).permitAll()
-                        .requestMatchers("/actuator/metrics", "/actuator/metrics/**", "/actuator/prometheus")
-                                .hasAuthority("SCOPE_ops:read")
-                        .requestMatchers(HttpMethod.POST, "/api/v1/payments").hasAuthority("SCOPE_payments:write")
-                        .requestMatchers(HttpMethod.GET, "/api/v1/payments/**").hasAuthority("SCOPE_payments:read")
-                        .anyRequest().authenticated()
-                )
+                .authorizeHttpRequests(authorize -> {
+                    authorize.requestMatchers(
+                            "/actuator/health",
+                            "/actuator/health/**",
+                            "/actuator/info",
+                            "/v3/api-docs/**",
+                            "/swagger-ui.html",
+                            "/swagger-ui/**",
+                            "/error"
+                    ).permitAll();
+
+                    if (publicPrometheus) {
+                        authorize.requestMatchers("/actuator/prometheus").permitAll();
+                    } else {
+                        authorize.requestMatchers("/actuator/prometheus").hasAuthority("SCOPE_ops:read");
+                    }
+
+                    authorize.requestMatchers("/actuator/metrics", "/actuator/metrics/**")
+                            .hasAuthority("SCOPE_ops:read");
+                    authorize.requestMatchers(HttpMethod.POST, "/api/v1/payments")
+                            .hasAuthority("SCOPE_payments:write");
+                    authorize.requestMatchers(HttpMethod.GET, "/api/v1/payments/**")
+                            .hasAuthority("SCOPE_payments:read");
+                    authorize.anyRequest().authenticated();
+                })
                 .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()));
 
         return http.build();
