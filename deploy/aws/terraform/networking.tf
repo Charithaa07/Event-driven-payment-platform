@@ -39,7 +39,7 @@ resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
   availability_zone       = local.azs[count.index]
   cidr_block              = local.public_subnet_cidrs[count.index]
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = false
 
   tags = {
     Name                     = "${local.name}-public-${count.index + 1}"
@@ -121,13 +121,6 @@ resource "aws_security_group" "rds" {
     protocol    = "tcp"
     cidr_blocks = [var.vpc_cidr]
   }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
 }
 
 resource "aws_security_group" "msk" {
@@ -142,13 +135,6 @@ resource "aws_security_group" "msk" {
     protocol    = "tcp"
     cidr_blocks = [var.vpc_cidr]
   }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
 }
 
 resource "aws_security_group" "redis" {
@@ -162,12 +148,5 @@ resource "aws_security_group" "redis" {
     to_port     = 6379
     protocol    = "tcp"
     cidr_blocks = [var.vpc_cidr]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
   }
 }
