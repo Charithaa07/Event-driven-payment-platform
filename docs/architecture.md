@@ -1,60 +1,86 @@
 # Architecture Notes
 
-## Phase 6.1 request and event flow
+## Phase 7 request and event flow
 
-1. Client sends `POST /api/v1/payments` with an `Idempotency-Key`.
-2. Payment Service checks Redis for a cached response associated with the key.
-3. On a cache hit, the cached payment is compared with the incoming request. Matching data returns the original payment; different data raises an idempotency conflict.
-4. On a Redis miss or Redis failure, Payment Service checks PostgreSQL for the durable key mapping and applies the same request comparison.
-5. If the key is absent, Payment Service attempts `INSERT ... ON CONFLICT DO NOTHING` inside the payment transaction.
-6. A successful insert writes the payment and its `payments.created.v1` outbox event in the same transaction.
-7. If another request won the insert race, the losing request loads the winning payment. Matching request data returns the winner; different data returns `409 Conflict`.
-8. The newly created response is cached in Redis only after the payment/outbox transaction commits.
-9. An outbox relay claims eligible rows in a short PostgreSQL transaction using `FOR UPDATE SKIP LOCKED`, marks them `PROCESSING`, records `claimed_at`, and commits the claim.
-10. Kafka publication happens after that claim transaction has ended.
-11. A successful send marks the event `PUBLISHED`. A failed send records diagnostics and schedules a later attempt using bounded backoff. Events that reach the maximum attempt count become `FAILED`.
-12. A stale `PROCESSING` lease becomes claimable again so an instance crash cannot strand the event permanently.
-13. Transaction Service consumes `payments.created.v1`, checks `processed_events`, and writes its transaction row and processed-event marker together.
-14. Kafka offsets advance after successful local processing.
-15. Retryable consumer failures receive two retries with a one-second fixed backoff; exhausted failures go to `payments.created.v1.DLT`.
-16. Malformed payloads are non-retryable and go directly to the DLT.
+1. A client obtains a bearer access token from an external OAuth2/OIDC provider.
+2. Payment Service acts as a stateless OAuth2 Resource Server and validates the JWT signature against the configured JWKS.
+3. The token is also validated for issuer, audience, expiry/timing, and a non-empty subject no longer than the payment `customer_id` boundary.
+4. `POST /api/v1/payments` requires `payments:write`; `GET /api/v1/payments/{id}` requires `payments:read`.
+5. The JWT `sub` claim becomes the trusted customer identity. `customerId` is not accepted as trusted create-payment input.
+6. Payment retrieval queries by both payment ID and authenticated customer ID. A resource owned by another customer therefore resolves as `404`.
+7. Payment request idempotency is scoped by `(customer_id, idempotency_key)` in PostgreSQL and by a hashed customer/key namespace in Redis.
+8. On a Redis miss or failure, Payment Service checks PostgreSQL for that authenticated customer's durable idempotency mapping.
+9. If absent, Payment Service attempts `INSERT ... ON CONFLICT DO NOTHING` against the customer-scoped uniqueness constraint.
+10. The winning insert creates the payment and `payments.created.v1` outbox record in the same transaction; a losing concurrent request loads the same customer's winner.
+11. Redis is populated only after the payment/outbox transaction commits.
+12. The outbox relay claims eligible rows in a short transaction using `FOR UPDATE SKIP LOCKED`, records a processing lease, and commits the claim before Kafka I/O.
+13. Successful publication marks the event `PUBLISHED`; failure schedules bounded backoff or eventually marks it `FAILED`.
+14. Transaction Service consumes `payments.created.v1`, commits its business transaction and `processed_events` marker together, and safely tolerates redelivery.
+15. Retryable consumer failures receive two retries; exhausted or malformed events are routed to `payments.created.v1.DLT`.
 
-## Payment request idempotency
+## Security boundary
 
 ```text
-POST /api/v1/payments + Idempotency-Key
+OAuth2 / OIDC Provider
+        |
+        | publishes signing keys
+        v
+      JWKS
         |
         v
-Redis response cache
+Payment Service resource server
         |
-        +-- hit --> compare request
-        |              +-- same ---------> return original payment
-        |              `-- different ----> 409 Conflict
+        +-- verify JWT signature
+        +-- validate issuer
+        +-- validate audience
+        +-- validate exp / timing
+        +-- validate subject
         |
-        `-- miss / unavailable
-                 |
-                 v
-          PostgreSQL lookup
-                 |
-                 +-- existing --> compare request --> warm Redis / 409
-                 |
-                 `-- absent
-                        |
-                        v
-             INSERT ... ON CONFLICT DO NOTHING
-                 |
-                 +-- won race
-                 |     +-- INSERT payment
-                 |     +-- INSERT outbox event
-                 |     `-- COMMIT -> cache response
-                 |
-                 `-- lost race
-                       `-- load winner -> compare request -> return / 409
+        v
+OAuth scope authorization
+        |
+        +-- payments:write -> POST /api/v1/payments
+        +-- payments:read  -> GET  /api/v1/payments/{id}
+        `-- ops:read       -> actuator metrics / prometheus
+        |
+        v
+JWT sub -> customer ownership identity
 ```
 
-PostgreSQL is the correctness boundary. Redis can be absent or unavailable without changing the API's durable idempotency guarantee. The database insert is deliberately conflict-tolerant so simultaneous retries do not surface a uniqueness exception to one caller.
+The service does not issue tokens. Credential issuance, login, MFA, refresh tokens, and authorization grants belong to the external identity provider. Payment Service only validates bearer access tokens and enforces authorization at its boundary.
 
-The key is bound to the original payment semantics. The service compares amount, currency, and customer before returning an existing payment. Reusing the same key with different payment data is treated as a conflict rather than silently returning unrelated state.
+`/actuator/health` and `/actuator/info` remain public so infrastructure can probe the service without application credentials. Metrics and Prometheus endpoints require `ops:read` because they can reveal operational information.
+
+## Customer ownership and request idempotency
+
+```text
+POST /api/v1/payments
+Bearer JWT sub = customer-A
+Idempotency-Key = checkout-42
+        |
+        v
+Redis key = SHA-256(customer-A + separator + checkout-42)
+        |
+        +-- hit --> compare amount/currency --> return / 409
+        |
+        `-- miss
+             |
+             v
+PostgreSQL lookup
+WHERE customer_id = customer-A
+  AND idempotency_key = checkout-42
+             |
+             +-- existing --> compare --> return / 409
+             |
+             `-- absent
+                  |
+                  v
+INSERT ... ON CONFLICT (customer_id, idempotency_key) DO NOTHING
+```
+
+This avoids both failure modes of a global idempotency key: one customer cannot collide with another customer's retry key, and cached results cannot leak across customer boundaries. Two customers may use the same textual key and receive independent payments.
+
+For one customer, the key remains bound to the original payment semantics. Reusing it with a different amount or currency returns `409 Conflict`.
 
 ## Transactional outbox and multi-instance claiming
 
@@ -76,17 +102,14 @@ COMMIT
 Kafka send outside DB transaction
     |
     +-- success --> PUBLISHED
-    |
-    `-- failure --> PENDING + next_attempt_at + last_error
+    `-- failure --> PENDING + backoff + last_error
                          |
                          `-- attempts exhausted --> FAILED
-
-stale PROCESSING lease (>30s) --> eligible for reclaim
 ```
 
-`SKIP LOCKED` lets multiple Payment Service instances poll concurrently without waiting on or claiming the same rows in the same pass. The processing lease handles crashes after claiming. Kafka I/O is intentionally outside the claim transaction so a slow broker does not keep row locks and a database transaction open for the duration of a network request.
+`SKIP LOCKED` lets multiple Payment Service instances poll concurrently without waiting on the same rows. A stale `PROCESSING` lease becomes claimable again if an instance dies after claiming. Kafka I/O remains outside the claim transaction so broker latency does not hold database locks open.
 
-This design still provides at-least-once delivery, not cross-system exactly-once delivery. A process can die after Kafka accepts an event but before PostgreSQL records `PUBLISHED`, causing the event to be sent again. Downstream idempotency is therefore a required part of the design.
+The delivery guarantee is at-least-once. If Kafka accepts an event and the process dies before PostgreSQL records `PUBLISHED`, the event can be sent again. Consumer idempotency is therefore part of the architecture, not an optional optimization.
 
 ## Consumer failure flow
 
@@ -106,63 +129,50 @@ Transaction Service
         `-- malformed payload ------------> payments.created.v1.DLT
 ```
 
-The Transaction Service stores the immutable event ID in `processed_events`. Its business transaction row and processed-event marker are committed together. Database-level uniqueness on payment/source-event IDs adds another guard against repeated writes.
+Transaction Service stores the immutable event ID in `processed_events`. The business transaction row and processed-event marker commit together, with database uniqueness constraints providing an additional duplicate-write guard.
 
 ## Service data ownership
 
-Payment Service owns the payment PostgreSQL database on local port `5432`.
-Transaction Service owns a separate PostgreSQL database on local port `5433`.
+Payment Service owns the payment PostgreSQL database on local port `5432`. Transaction Service owns a separate PostgreSQL database on local port `5433`. Neither service reads the other's tables; Kafka is the integration boundary.
 
-Neither service reads the other service's tables. Kafka is the service integration boundary. Redis is shared infrastructure used only to accelerate Payment Service idempotency responses and does not own durable payment state.
-
-## Retry policies
-
-### Consumer
-
-- Original delivery + 2 retries
-- 1 second between attempts
-- `IllegalArgumentException` is non-retryable
-- Exhausted failures are published to `<original-topic>.DLT`
-- DLT send failures are surfaced
-
-### Outbox relay
-
-- Claiming increments the delivery attempt count
-- Failed deliveries receive bounded exponential backoff
-- Default maximum attempts: 10
-- Default backoff starts at 1 second and is capped at 60 seconds
-- Final exhausted state: `FAILED`
-- `PROCESSING` rows older than the lease window are eligible for reclaim
-
-The consumer currently uses blocking retries. A future scale-oriented iteration could use non-blocking retry topics for long delays.
+Within Payment Service, authenticated customer identity is enforced in repository queries. Redis is shared infrastructure but contains only an optimization of the customer-scoped idempotency result; PostgreSQL remains authoritative.
 
 ## Container-backed verification
 
-The Maven integration suite exercises real Redis, PostgreSQL, and Kafka dependencies through Testcontainers.
+The Maven suite exercises real Redis, PostgreSQL, and Kafka dependencies through Testcontainers and runs HTTP authorization checks through Spring Security's filter chain.
 
-### Payment Service
+### Payment Service verification
 
-A PostgreSQL + Redis suite verifies:
+The suite verifies:
 
-- two simultaneous same-key create requests resolve to one payment;
-- only one outbox event is created for the winning insert;
-- same-key/different-body requests are rejected;
-- rolled-back payment/outbox work never populates Redis;
-- committed responses are cached;
-- Flyway can bootstrap the payment schema, including the hardened outbox migration;
-- the `FOR UPDATE SKIP LOCKED` claim query executes successfully against real PostgreSQL.
+- two simultaneous same-customer/same-key creates resolve to one payment and one outbox event;
+- different customers can independently reuse the same textual idempotency key;
+- same-customer/same-key/different-body requests return an idempotency conflict;
+- rolled-back work does not populate Redis;
+- the Phase 7 Flyway migration changes uniqueness to `(customer_id, idempotency_key)`;
+- the native `FOR UPDATE SKIP LOCKED` claim query executes against PostgreSQL;
+- unauthenticated payment creation receives `401`;
+- authenticated requests with the wrong scope receive `403`;
+- the JWT subject overrides/ignores spoofed customer identity in JSON;
+- payment reads enforce ownership and return `404` to other customers;
+- health is public while metrics require `ops:read`.
 
-A separate Redis test verifies TTL behavior and malformed-cache eviction. Unit coverage forces a Redis connection failure to prove the fast path remains fail-open.
+The MockMvc JWT tests exercise the authorization/filter-chain behavior without contacting an external identity provider. Production token signature and claim validation are provided by the configured Nimbus JWT decoder using the provider's JWKS, issuer, and audience settings.
 
-### Transaction Service
+### Transaction Service verification
 
-The Kafka/PostgreSQL suite uses the regular `apache/kafka:4.0.0` image and verifies:
+A real Apache Kafka broker and PostgreSQL database verify duplicate delivery produces exactly one business transaction and malformed JSON reaches `payments.created.v1.DLT`.
 
-1. Publishing the same `payments.created.v1` event twice produces exactly one business transaction and one durable processed-event marker.
-2. Publishing malformed JSON causes the original record to appear on `payments.created.v1.DLT`.
+## Security configuration contract
 
-The regular Kafka image is intentionally used instead of the native image after a native-container crash was observed on a hosted CI runner.
+Production environments must provide:
 
-## Remaining reliability/operations work
+- `JWT_ISSUER_URI` — expected token issuer
+- `JWT_AUDIENCE` — required audience, default logical API name `payment-api`
+- `JWT_JWK_SET_URI` — provider JWKS endpoint used for signature verification
 
-The core reliability mechanisms through Phase 6.1 are implemented. Future iterations can add operational DLT replay, metrics and traces for outbox age/retry count/DLT volume/consumer lag, stronger relay ownership identifiers and configurable lease duration, and production deployment controls such as Kubernetes probes and AWS infrastructure.
+The values checked into `application.yml` are development placeholders and are not credentials.
+
+## Next milestones
+
+The main remaining platform work is OpenAPI documentation, richer OpenTelemetry/Prometheus/Grafana observability, operational DLT replay, and deployment infrastructure such as Kubernetes/Helm and AWS architecture.

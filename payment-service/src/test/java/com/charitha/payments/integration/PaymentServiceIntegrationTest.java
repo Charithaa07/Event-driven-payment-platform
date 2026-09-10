@@ -239,6 +239,30 @@ class PaymentServiceIntegrationTest {
                 .andExpect(status().isNotFound());
     }
 
+    @Test
+    void healthEndpointRemainsPublicForProbes() throws Exception {
+        mockMvc.perform(get("/actuator/health"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void metricsRequireOpsReadScope() throws Exception {
+        mockMvc.perform(get("/actuator/metrics"))
+                .andExpect(status().isUnauthorized());
+
+        mockMvc.perform(get("/actuator/metrics")
+                        .with(jwt()
+                                .jwt(token -> token.subject("operator-1"))
+                                .authorities(new SimpleGrantedAuthority("SCOPE_payments:read"))))
+                .andExpect(status().isForbidden());
+
+        mockMvc.perform(get("/actuator/metrics")
+                        .with(jwt()
+                                .jwt(token -> token.subject("operator-1"))
+                                .authorities(new SimpleGrantedAuthority("SCOPE_ops:read"))))
+                .andExpect(status().isOk());
+    }
+
     private Payment createAfterBarrier(String key,
                                        CreatePaymentRequest request,
                                        String customerId,
