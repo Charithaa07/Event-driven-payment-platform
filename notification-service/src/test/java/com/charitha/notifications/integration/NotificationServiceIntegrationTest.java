@@ -1,5 +1,8 @@
 package com.charitha.notifications.integration;
 
+import com.charitha.notifications.delivery.DeliveryReceipt;
+import com.charitha.notifications.delivery.NotificationProvider;
+import com.charitha.notifications.delivery.NotificationProviderException;
 import com.charitha.notifications.domain.NotificationDelivery;
 import com.charitha.notifications.domain.NotificationDeliveryRepository;
 import com.charitha.notifications.domain.NotificationStatus;
@@ -12,7 +15,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
+import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
@@ -33,7 +40,9 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -46,8 +55,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @Testcontainers
+@Import(NotificationServiceIntegrationTest.ProviderTestConfig.class)
 @SpringBootTest(properties = {
-        "notifications.dispatch.fixed-delay-ms=100",
+        "notifications.dispatch.fixed-delay-ms=50",
+        "notifications.dispatch.base-backoff-ms=100",
+        "notifications.dispatch.max-backoff-ms=200",
         "notifications.dispatch.lease-timeout-ms=1000"
 })
 class NotificationServiceIntegrationTest {
@@ -95,10 +107,11 @@ class NotificationServiceIntegrationTest {
     }
 
     @Test
-    void duplicateLogicalEventCreatesOneDeliveryAndDispatcherSendsIt() throws Exception {
+    void duplicateLogicalEventCreatesOneDeliveryAndRetryEventuallySendsIt() throws Exception {
         UUID eventId = UUID.randomUUID();
         UUID paymentId = UUID.randomUUID();
-        String payload = jsonMapper.writeValueAsString(paymentEvent(eventId, paymentId));
+        String payload = jsonMapper.writeValueAsString(paymentEvent(
+                eventId, paymentId, "customer-notification-1"));
 
         kafkaTemplate.send(PAYMENT_TOPIC, paymentId.toString(), payload).get(10, TimeUnit.SECONDS);
         kafkaTemplate.send(PAYMENT_TOPIC, paymentId.toString(), payload).get(10, TimeUnit.SECONDS);
@@ -109,10 +122,27 @@ class NotificationServiceIntegrationTest {
 
         NotificationDelivery delivery = repository.findByPaymentIdOrderByCreatedAtAsc(paymentId).get(0);
         assertEquals(eventId, delivery.getSourceEventId());
-        assertEquals(1, delivery.getAttemptCount());
-        assertEquals("logging", delivery.getProvider());
+        assertEquals(2, delivery.getAttemptCount());
+        assertEquals("test-provider", delivery.getProvider());
         assertNotNull(delivery.getProviderMessageId());
-        assertTrue(delivery.getProviderMessageId().startsWith("log-"));
+        assertTrue(delivery.getProviderMessageId().startsWith("test-"));
+    }
+
+    @Test
+    void permanentProviderFailureStopsAfterOneAttempt() throws Exception {
+        UUID eventId = UUID.randomUUID();
+        UUID paymentId = UUID.randomUUID();
+        String payload = jsonMapper.writeValueAsString(paymentEvent(
+                eventId, paymentId, "customer-permanent-failure"));
+
+        kafkaTemplate.send(PAYMENT_TOPIC, paymentId.toString(), payload).get(10, TimeUnit.SECONDS);
+
+        awaitTrue(() -> repository.findByPaymentIdOrderByCreatedAtAsc(paymentId).stream()
+                .anyMatch(delivery -> delivery.getStatus() == NotificationStatus.FAILED), Duration.ofSeconds(15));
+
+        NotificationDelivery delivery = repository.findByPaymentIdOrderByCreatedAtAsc(paymentId).get(0);
+        assertEquals(1, delivery.getAttemptCount());
+        assertTrue(delivery.getLastError().contains("permanent provider rejection"));
     }
 
     @Test
@@ -175,18 +205,19 @@ class NotificationServiceIntegrationTest {
     }
 
     private void publishAndAwait(UUID eventId, UUID paymentId) throws Exception {
-        String payload = jsonMapper.writeValueAsString(paymentEvent(eventId, paymentId));
+        String payload = jsonMapper.writeValueAsString(paymentEvent(
+                eventId, paymentId, "customer-notification-api"));
         kafkaTemplate.send(PAYMENT_TOPIC, paymentId.toString(), payload).get(10, TimeUnit.SECONDS);
         awaitTrue(() -> !repository.findByPaymentIdOrderByCreatedAtAsc(paymentId).isEmpty(), Duration.ofSeconds(15));
     }
 
-    private PaymentCreatedEvent paymentEvent(UUID eventId, UUID paymentId) {
+    private PaymentCreatedEvent paymentEvent(UUID eventId, UUID paymentId, String customerId) {
         return new PaymentCreatedEvent(
                 eventId,
                 paymentId,
                 new BigDecimal("42.50"),
                 "USD",
-                "customer-notification-1",
+                customerId,
                 Instant.now()
         );
     }
@@ -223,5 +254,30 @@ class NotificationServiceIntegrationTest {
             Thread.sleep(100L);
         }
         throw new AssertionError("Condition not satisfied within " + timeout);
+    }
+
+    @TestConfiguration
+    static class ProviderTestConfig {
+        @Bean
+        @Primary
+        NotificationProvider flakyProvider() {
+            ConcurrentHashMap<UUID, AtomicInteger> attempts = new ConcurrentHashMap<>();
+            return message -> {
+                if (message.customerReference().contains("permanent-failure")) {
+                    throw new NotificationProviderException("permanent provider rejection", false);
+                }
+
+                int attempt = attempts
+                        .computeIfAbsent(message.idempotencyKey(), ignored -> new AtomicInteger())
+                        .incrementAndGet();
+                if (attempt == 1) {
+                    throw new NotificationProviderException("temporary provider outage", true);
+                }
+                return new DeliveryReceipt(
+                        "test-provider",
+                        "test-" + message.idempotencyKey()
+                );
+            };
+        }
     }
 }

@@ -58,23 +58,27 @@ public class NotificationDispatcher {
             );
             metrics.recordDelivery("sent");
         } catch (NotificationProviderException ex) {
-            completionService.markFailedAttempt(
+            NotificationFailureDisposition disposition = completionService.markFailedAttempt(
                     notification.notificationId(),
                     provider.getClass().getSimpleName(),
                     ex.getMessage(),
                     ex.isRetryable(),
                     Instant.now()
             );
-            metrics.recordDelivery(ex.isRetryable() ? "retry_scheduled" : "failed");
+            metrics.recordDelivery(disposition == NotificationFailureDisposition.RETRY_SCHEDULED
+                    ? "retry_scheduled"
+                    : "failed");
         } catch (RuntimeException ex) {
-            completionService.markFailedAttempt(
+            NotificationFailureDisposition disposition = completionService.markFailedAttempt(
                     notification.notificationId(),
                     provider.getClass().getSimpleName(),
                     ex.getMessage(),
                     true,
                     Instant.now()
             );
-            metrics.recordDelivery("retry_scheduled");
+            metrics.recordDelivery(disposition == NotificationFailureDisposition.RETRY_SCHEDULED
+                    ? "retry_scheduled"
+                    : "failed");
         }
     }
 }

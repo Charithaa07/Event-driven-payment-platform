@@ -37,7 +37,7 @@ public class NotificationCompletionService {
     }
 
     @Transactional
-    public void markFailedAttempt(
+    public NotificationFailureDisposition markFailedAttempt(
             UUID notificationId,
             String provider,
             String error,
@@ -45,16 +45,20 @@ public class NotificationCompletionService {
             Instant now) {
         NotificationDelivery delivery = repository.findById(notificationId).orElseThrow();
         if (delivery.getStatus() != NotificationStatus.PROCESSING) {
-            return;
+            return delivery.getStatus() == NotificationStatus.RETRY_PENDING
+                    ? NotificationFailureDisposition.RETRY_SCHEDULED
+                    : NotificationFailureDisposition.FAILED;
         }
 
         String safeError = truncate(error);
         if (retryable && delivery.getAttemptCount() < maxAttempts) {
             long delayMs = backoffForAttempt(delivery.getAttemptCount());
             delivery.markRetry(provider, safeError, now.plusMillis(delayMs), now);
-        } else {
-            delivery.markFailed(provider, safeError, now);
+            return NotificationFailureDisposition.RETRY_SCHEDULED;
         }
+
+        delivery.markFailed(provider, safeError, now);
+        return NotificationFailureDisposition.FAILED;
     }
 
     private long backoffForAttempt(int attempt) {
