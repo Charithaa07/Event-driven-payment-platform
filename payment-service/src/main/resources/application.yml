@@ -18,6 +18,10 @@ spring:
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
 
+idempotency:
+  redis:
+    ttl-hours: ${IDEMPOTENCY_REDIS_TTL_HOURS:24}
+
 management:
   endpoints:
     web:
