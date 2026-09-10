@@ -28,11 +28,26 @@ public class DeadLetterEvent {
     @Column(name = "dlt_offset", nullable = false)
     private long dltOffset;
 
+    @Column(name = "original_partition")
+    private Integer originalPartition;
+
+    @Column(name = "original_offset")
+    private Long originalOffset;
+
+    @Column(name = "original_consumer_group", length = 255)
+    private String originalConsumerGroup;
+
     @Column(name = "message_key", length = 255)
     private String messageKey;
 
     @Column(nullable = false, columnDefinition = "TEXT")
     private String payload;
+
+    @Column(name = "failure_class", length = 500)
+    private String failureClass;
+
+    @Column(name = "failure_message", length = 1000)
+    private String failureMessage;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
@@ -84,8 +99,13 @@ public class DeadLetterEvent {
     public String getDltTopic() { return dltTopic; }
     public int getDltPartition() { return dltPartition; }
     public long getDltOffset() { return dltOffset; }
+    public Integer getOriginalPartition() { return originalPartition; }
+    public Long getOriginalOffset() { return originalOffset; }
+    public String getOriginalConsumerGroup() { return originalConsumerGroup; }
     public String getMessageKey() { return messageKey; }
     public String getPayload() { return payload; }
+    public String getFailureClass() { return failureClass; }
+    public String getFailureMessage() { return failureMessage; }
     public DeadLetterStatus getStatus() { return status; }
     public Instant getReceivedAt() { return receivedAt; }
     public Instant getReplayClaimedAt() { return replayClaimedAt; }
