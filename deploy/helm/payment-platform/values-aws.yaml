@@ -1,0 +1,65 @@
+fullnameOverride: payment-platform
+
+serviceAccount:
+  create: true
+  perService: true
+  name: ""
+
+global:
+  environment: aws-prod
+  kafkaBootstrapServers: SET_BY_DEPLOY_WORKFLOW
+  kafkaIamAuthEnabled: true
+  redisHost: SET_BY_DEPLOY_WORKFLOW
+  redisPort: 6379
+  redisSslEnabled: true
+  jwtIssuerUri: SET_BY_DEPLOY_WORKFLOW
+  jwtJwkSetUri: SET_BY_DEPLOY_WORKFLOW
+  tracingSamplingProbability: "0.10"
+  otelTracingEnabled: true
+  # Point this at an ADOT/OpenTelemetry Collector service in the cluster.
+  otelTracesEndpoint: http://adot-collector.monitoring.svc.cluster.local:4318/v1/traces
+  observabilityPublicPrometheus: false
+
+secrets:
+  existingSecret: payment-platform-secrets
+
+ingress:
+  enabled: false
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+  host: payments.example.com
+
+services:
+  payment:
+    image:
+      repository: SET_BY_DEPLOY_WORKFLOW
+      tag: SET_BY_DEPLOY_WORKFLOW
+      pullPolicy: IfNotPresent
+    database:
+      url: SET_BY_DEPLOY_WORKFLOW
+
+  transaction:
+    image:
+      repository: SET_BY_DEPLOY_WORKFLOW
+      tag: SET_BY_DEPLOY_WORKFLOW
+      pullPolicy: IfNotPresent
+    database:
+      url: SET_BY_DEPLOY_WORKFLOW
+
+  audit:
+    image:
+      repository: SET_BY_DEPLOY_WORKFLOW
+      tag: SET_BY_DEPLOY_WORKFLOW
+      pullPolicy: IfNotPresent
+    database:
+      url: SET_BY_DEPLOY_WORKFLOW
+
+  notification:
+    image:
+      repository: SET_BY_DEPLOY_WORKFLOW
+      tag: SET_BY_DEPLOY_WORKFLOW
+      pullPolicy: IfNotPresent
+    database:
+      url: SET_BY_DEPLOY_WORKFLOW
