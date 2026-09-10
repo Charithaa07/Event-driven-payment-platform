@@ -23,9 +23,15 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{- define "payment-platform.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create -}}
-{{- default (include "payment-platform.fullname" .) .Values.serviceAccount.name -}}
+{{- $root := .root -}}
+{{- $name := .name -}}
+{{- if $root.Values.serviceAccount.create -}}
+  {{- if $root.Values.serviceAccount.perService -}}
+    {{- include "payment-platform.serviceName" (dict "root" $root "name" $name) -}}
+  {{- else -}}
+    {{- default (include "payment-platform.fullname" $root) $root.Values.serviceAccount.name -}}
+  {{- end -}}
 {{- else -}}
-{{- default "default" .Values.serviceAccount.name -}}
+  {{- default "default" $root.Values.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
