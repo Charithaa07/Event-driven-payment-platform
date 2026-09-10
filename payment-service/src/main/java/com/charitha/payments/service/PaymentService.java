@@ -4,15 +4,19 @@ import com.charitha.payments.api.CreatePaymentRequest;
 import com.charitha.payments.domain.Payment;
 import com.charitha.payments.domain.PaymentRepository;
 import com.charitha.payments.domain.PaymentStatus;
+import com.charitha.payments.idempotency.RedisIdempotencyStore;
 import com.charitha.payments.messaging.PaymentCreatedEvent;
 import com.charitha.payments.outbox.OutboxEvent;
 import com.charitha.payments.outbox.OutboxEventRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -22,25 +26,54 @@ public class PaymentService {
     private final PaymentRepository repository;
     private final OutboxEventRepository outboxRepository;
     private final JsonMapper jsonMapper;
+    private final RedisIdempotencyStore idempotencyStore;
 
     public PaymentService(PaymentRepository repository,
                           OutboxEventRepository outboxRepository,
-                          JsonMapper jsonMapper) {
+                          JsonMapper jsonMapper,
+                          RedisIdempotencyStore idempotencyStore) {
         this.repository = repository;
         this.outboxRepository = outboxRepository;
         this.jsonMapper = jsonMapper;
+        this.idempotencyStore = idempotencyStore;
     }
 
     @Transactional
     public Payment create(String idempotencyKey, CreatePaymentRequest request) {
-        return repository.findByIdempotencyKey(idempotencyKey)
-                .orElseGet(() -> createNew(idempotencyKey, request));
+        Optional<Payment> cachedPayment = findCachedPayment(idempotencyKey);
+        if (cachedPayment.isPresent()) {
+            return cachedPayment.get();
+        }
+
+        Optional<Payment> persistedPayment = repository.findByIdempotencyKey(idempotencyKey);
+        if (persistedPayment.isPresent()) {
+            Payment payment = persistedPayment.get();
+            idempotencyStore.put(idempotencyKey, payment.getId());
+            return payment;
+        }
+
+        Payment created = createNew(idempotencyKey, request);
+        cacheAfterCommit(idempotencyKey, created.getId());
+        return created;
     }
 
     @Transactional(readOnly = true)
     public Payment get(UUID paymentId) {
         return repository.findById(paymentId)
                 .orElseThrow(() -> new PaymentNotFoundException(paymentId));
+    }
+
+    private Optional<Payment> findCachedPayment(String idempotencyKey) {
+        Optional<UUID> cachedPaymentId = idempotencyStore.findPaymentId(idempotencyKey);
+        if (cachedPaymentId.isEmpty()) {
+            return Optional.empty();
+        }
+
+        Optional<Payment> payment = repository.findById(cachedPaymentId.get());
+        if (payment.isEmpty()) {
+            idempotencyStore.evict(idempotencyKey);
+        }
+        return payment;
     }
 
     private Payment createNew(String idempotencyKey, CreatePaymentRequest request) {
@@ -76,6 +109,20 @@ public class PaymentService {
         ));
 
         return saved;
+    }
+
+    private void cacheAfterCommit(String idempotencyKey, UUID paymentId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            idempotencyStore.put(idempotencyKey, paymentId);
+            return;
+        }
+
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                idempotencyStore.put(idempotencyKey, paymentId);
+            }
+        });
     }
 
     private String serialize(PaymentCreatedEvent event) {
