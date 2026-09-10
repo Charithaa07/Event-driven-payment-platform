@@ -1,19 +1,20 @@
 # Event-Driven Payment Platform
 
-A portfolio-grade payment processing backend focused on engineering concerns that matter in distributed systems: **authenticated APIs, idempotency, durable persistence, event-driven workflows, failure isolation, concurrency safety, and clear service boundaries**.
+A portfolio-grade payment processing backend focused on engineering concerns that matter in distributed systems: **authenticated APIs, idempotency, durable persistence, event-driven workflows, failure isolation, concurrency safety, explicit API contracts, and clear service boundaries**.
 
-> Status: **Phase 7** — OAuth2/JWT resource-server security, customer-scoped idempotency, concurrency-safe payment creation, Redis fast-path caching, transactional outbox delivery, idempotent Kafka consumption, bounded retries/DLT recovery, and container-backed integration testing are implemented. OpenAPI and deeper observability are next.
+> Status: **Phase 8** — OAuth2/JWT resource-server security, customer-scoped idempotency, concurrency-safe payment creation, Redis fast-path caching, transactional outbox delivery, idempotent Kafka consumption, bounded retries/DLT recovery, OpenAPI/Swagger documentation, and container-backed integration testing are implemented. Deeper observability is next.
 
 ## Why this project exists
 
-Payment APIs look simple until retries, simultaneous duplicate requests, identity boundaries, partial failures, asynchronous processing, and audit requirements are introduced. This project develops those concerns incrementally instead of hiding them behind a CRUD example.
+Payment APIs look simple until retries, simultaneous duplicate requests, identity boundaries, partial failures, asynchronous processing, client contracts, and audit requirements are introduced. This project develops those concerns incrementally instead of hiding them behind a CRUD example.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     IDP[OAuth2 / OIDC Provider] -->|JWKS| P[Payment Service]
-    C[Client] -->|Bearer JWT + POST /api/v1/payments| P
+    C[Client] -->|Bearer JWT + REST| P
+    D[Swagger UI / OpenAPI Client] -->|API contract| P
     P -->|customer-scoped fast path| R[(Redis)]
     P -->|durability boundary| PG[(Payment PostgreSQL)]
     PG --> O[(Outbox Events)]
@@ -48,6 +49,9 @@ flowchart LR
 - Kafka publication outside the short database claim transaction
 - Separate Transaction Service datastore and durable consumer idempotency
 - Bounded Kafka consumer retries and `payments.created.v1.DLT`
+- Runtime-generated OpenAPI contract for the Payment Service
+- Swagger UI with JWT bearer authorization support
+- Documented request schemas, response schemas, idempotency header, ownership semantics, and error responses
 - Testcontainers coverage with real PostgreSQL, Redis, and Kafka
 - GitHub Actions Maven CI
 
@@ -105,6 +109,26 @@ customer-scoped Redis response cache
 ```
 
 The same textual idempotency key can safely be used by two different authenticated customers. PostgreSQL enforces uniqueness on `(customer_id, idempotency_key)`, and Redis uses a SHA-256-derived customer/key namespace so cache entries cannot collide across customers.
+
+## API documentation
+
+The Payment Service publishes a runtime-generated OpenAPI contract using springdoc. Documentation endpoints are intentionally public so developers and tooling can inspect the contract without gaining access to payment data.
+
+- Swagger UI: `http://localhost:8080/swagger-ui.html`
+- OpenAPI JSON: `http://localhost:8080/v3/api-docs`
+- OpenAPI YAML: `http://localhost:8080/v3/api-docs.yaml`
+
+The contract documents JWT bearer authentication and the required scopes in each operation description. Swagger UI's **Authorize** control accepts an access token, while Spring Security continues to enforce the real authorization rules at runtime.
+
+The API contract includes:
+
+- `Idempotency-Key` as a required payment-create header;
+- amount/currency validation and examples;
+- JWT-derived customer ownership semantics;
+- `201`, `400`, `401`, `403`, `404`, and `409` response behavior;
+- payment and application-error response schemas.
+
+The integration suite calls `/v3/api-docs` and asserts key contract elements, reducing the chance that security or controller changes silently drift away from the published documentation.
 
 ## Outbox delivery flow
 
@@ -212,7 +236,9 @@ A PostgreSQL + Redis suite verifies:
 - insufficient scopes return `403`;
 - customer identity comes from JWT `sub` even when a spoofed `customerId` appears in JSON;
 - payment retrieval enforces authenticated ownership;
-- health remains public while metrics require `ops:read`.
+- health remains public while metrics require `ops:read`;
+- `/v3/api-docs` is publicly available and contains the expected bearer scheme, payment operations, idempotency header, and documented responses;
+- `/swagger-ui.html` is publicly reachable.
 
 ### Transaction Service
 
@@ -251,6 +277,10 @@ A globally unique idempotency key creates unnecessary cross-customer collisions.
 
 The resource server verifies token signatures using the configured JWKS and rejects tokens that fail issuer, audience, timing, or subject validation. Authorization then maps OAuth scopes to Spring Security authorities such as `SCOPE_payments:write`.
 
+### API documentation is executable contract evidence
+
+The OpenAPI description is generated from the same request models and controller annotations that serve runtime traffic. Validation annotations feed schema constraints, security requirements are declared alongside the protected operations, and integration tests inspect the generated document. This keeps the documentation closer to executable behavior than a manually maintained standalone API document.
+
 ### Transactional outbox and idempotent consumption
 
 Payment creation and outbox insertion commit atomically. The relay claims work with `SKIP LOCKED`, releases database locks before Kafka I/O, and retries failures with bounded backoff. Because publication is at-least-once, the Transaction Service commits the business transaction and durable processed-event marker together.
@@ -270,8 +300,9 @@ Payment creation and outbox insertion commit atomically. The relay claims work w
 - [x] PostgreSQL/Redis/Kafka Testcontainers integration tests
 - [x] OAuth2/JWT authentication and scope authorization
 - [x] JWT-derived customer ownership
+- [x] OpenAPI contract + Swagger UI
+- [x] OpenAPI contract integration verification
 - [x] Base CI pipeline
-- [ ] OpenAPI documentation
 - [ ] OpenTelemetry + Prometheus/Grafana dashboards
 - [ ] DLT replay / operational recovery endpoint
 - [ ] Notification service
@@ -282,6 +313,7 @@ Payment creation and outbox insertion commit atomically. The relay claims work w
 ## Tech stack
 
 **Backend:** Java 17, Spring Boot, Spring Security, OAuth2 Resource Server, Spring Data JPA, Spring Data Redis, Spring Kafka  
+**API:** REST, OpenAPI, springdoc, Swagger UI  
 **Data:** PostgreSQL, Redis  
 **Messaging:** Apache Kafka  
 **Security:** OAuth2, JWT, JWKS, scope-based authorization  

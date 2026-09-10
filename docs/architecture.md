@@ -1,6 +1,6 @@
 # Architecture Notes
 
-## Phase 7 request and event flow
+## Phase 8 request and event flow
 
 1. A client obtains a bearer access token from an external OAuth2/OIDC provider.
 2. Payment Service acts as a stateless OAuth2 Resource Server and validates the JWT signature against the configured JWKS.
@@ -17,6 +17,9 @@
 13. Successful publication marks the event `PUBLISHED`; failure schedules bounded backoff or eventually marks it `FAILED`.
 14. Transaction Service consumes `payments.created.v1`, commits its business transaction and `processed_events` marker together, and safely tolerates redelivery.
 15. Retryable consumer failures receive two retries; exhausted or malformed events are routed to `payments.created.v1.DLT`.
+16. springdoc derives an OpenAPI contract from Payment Service controllers, validation constraints, schemas, and explicit operation metadata.
+17. `/v3/api-docs`, `/v3/api-docs.yaml`, and the Swagger UI are publicly readable documentation surfaces; access to payment resources remains protected by Spring Security.
+18. Integration tests inspect the generated OpenAPI contract so security metadata, paths, idempotency headers, and response documentation cannot silently disappear.
 
 ## Security boundary
 
@@ -50,6 +53,31 @@ JWT sub -> customer ownership identity
 The service does not issue tokens. Credential issuance, login, MFA, refresh tokens, and authorization grants belong to the external identity provider. Payment Service only validates bearer access tokens and enforces authorization at its boundary.
 
 `/actuator/health` and `/actuator/info` remain public so infrastructure can probe the service without application credentials. Metrics and Prometheus endpoints require `ops:read` because they can reveal operational information.
+
+## API contract boundary
+
+```text
+PaymentController + request/response models + validation annotations
+                           |
+                           v
+                    springdoc OpenAPI
+                           |
+              +------------+------------+
+              |                         |
+              v                         v
+        /v3/api-docs              /swagger-ui.html
+              |                         |
+              +-----------+-------------+
+                          |
+                          v
+              clients / developers / tooling
+```
+
+The OpenAPI surface is intentionally readable without authentication because the contract contains interface metadata, not payment data. Swagger UI can accept a bearer token for interactive requests, but the UI itself does not bypass Spring Security: calls to the payment endpoints still require the same JWT scopes and ownership checks as any other client.
+
+The contract defines a JWT bearer security scheme and documents operation-specific scope requirements in the endpoint descriptions. Request and response schemas carry examples and validation semantics. The injected Spring Security `Jwt` principal is hidden from the generated operation parameters because it is server-side context, not client input.
+
+Payment-create documentation explicitly exposes the required `Idempotency-Key` header and the customer-scoped retry semantics. Error documentation distinguishes malformed input (`400`), missing/invalid authentication (`401`), insufficient scope (`403`), ownership/not-found behavior (`404`), and conflicting idempotent retries (`409`).
 
 ## Customer ownership and request idempotency
 
@@ -149,13 +177,16 @@ The suite verifies:
 - different customers can independently reuse the same textual idempotency key;
 - same-customer/same-key/different-body requests return an idempotency conflict;
 - rolled-back work does not populate Redis;
-- the Phase 7 Flyway migration changes uniqueness to `(customer_id, idempotency_key)`;
+- the Flyway migration changes uniqueness to `(customer_id, idempotency_key)`;
 - the native `FOR UPDATE SKIP LOCKED` claim query executes against PostgreSQL;
 - unauthenticated payment creation receives `401`;
 - authenticated requests with the wrong scope receive `403`;
 - the JWT subject overrides/ignores spoofed customer identity in JSON;
 - payment reads enforce ownership and return `404` to other customers;
-- health is public while metrics require `ops:read`.
+- health is public while metrics require `ops:read`;
+- the OpenAPI endpoint is public;
+- the generated document includes the bearer scheme, payment paths, idempotency header, success/error responses, and operation security requirement;
+- the Swagger UI entry point is public.
 
 The MockMvc JWT tests exercise the authorization/filter-chain behavior without contacting an external identity provider. Production token signature and claim validation are provided by the configured Nimbus JWT decoder using the provider's JWKS, issuer, and audience settings.
 
@@ -175,4 +206,4 @@ The values checked into `application.yml` are development placeholders and are n
 
 ## Next milestones
 
-The main remaining platform work is OpenAPI documentation, richer OpenTelemetry/Prometheus/Grafana observability, operational DLT replay, and deployment infrastructure such as Kubernetes/Helm and AWS architecture.
+The main remaining platform work is richer OpenTelemetry/Prometheus/Grafana observability, operational DLT replay, and deployment infrastructure such as Kubernetes/Helm and AWS architecture.
