@@ -18,10 +18,6 @@ Phase 16 adds executable security checks around the existing application, infras
 
 `.github/workflows/security.yml` runs on pull requests, pushes to `main`, a weekly schedule, and manual dispatch.
 
-### Dependency review
-
-Pull requests use GitHub dependency review and reject newly introduced dependencies with known **HIGH** or **CRITICAL** vulnerabilities. This is a change-focused gate: it prevents a PR from introducing a newly known high-risk dependency even when the existing dependency set is unchanged.
-
 ### CodeQL
 
 Java source is analyzed with CodeQL's `security-extended` query suite. CodeQL is intentionally separate from the normal Maven correctness job so a security-analysis failure is visible as its own control.
@@ -35,6 +31,8 @@ Trivy 0.74.0 scans three different risk classes:
 3. fixed CRITICAL dependency vulnerabilities are a hard failure.
 
 A broader HIGH/CRITICAL SARIF report is also generated and uploaded to GitHub code scanning. `--ignore-unfixed` is used for vulnerability gates so the build does not fail on a package for which no upstream fix exists; those findings remain visible in the report and should still be assessed.
+
+GitHub's Dependency Review API is not used as a required gate because it depends on the repository-level Dependency Graph feature being enabled. The Maven dependency set is still scanned directly by Trivy, and Dependabot is configured for proactive updates.
 
 ### Container image scan
 
