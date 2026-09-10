@@ -2,7 +2,7 @@
 
 A portfolio-grade payment processing backend focused on the engineering concerns that matter in real distributed systems: **idempotent APIs, durable persistence, event-driven workflows, failure isolation, observability, and clear service boundaries**.
 
-> Status: Phase 4 — Payment command service, transactional outbox, idempotent transaction consumer, bounded Kafka retries, and dead-letter recovery are implemented. Auth, observability, integration testing, and deployment are next.
+> Status: Phase 5 — Payment command service, transactional outbox, idempotent transaction consumer, bounded Kafka retries, dead-letter recovery, and real Kafka/PostgreSQL integration testing are implemented. Auth, observability, and deployment are next.
 
 ## Why this project exists
 
@@ -44,6 +44,10 @@ flowchart LR
 - Dead-letter routing to `payments.created.v1.DLT` after retries are exhausted
 - Malformed event payloads classified as non-retryable and sent directly to the DLT
 - Dead-letter publish failures surfaced instead of silently discarding records
+- Testcontainers integration tests with real PostgreSQL and Kafka containers
+- Integration coverage proving duplicate Kafka delivery creates one business transaction
+- Integration coverage proving malformed payloads are published to the DLT
+- Flyway migrations exercised against an ephemeral PostgreSQL database in CI
 - Spring Boot Actuator health/metrics endpoints
 - Unit tests covering API idempotency and duplicate event consumption
 - Docker Compose for both PostgreSQL datastores, Redis, and Kafka
@@ -86,6 +90,22 @@ initial attempt → payments.created.v1.DLT
 
 This design intentionally supports **at-least-once delivery**. If the consumer commits its database transaction but fails before the Kafka offset advances, the event can be delivered again. The `processed_events` table makes that redelivery safe.
 
+## Integration coverage
+
+The integration suite uses Testcontainers to start a real PostgreSQL 17 database and Apache Kafka broker during the Maven test lifecycle. It verifies behavior through the same Spring Boot application context used by the service rather than replacing Kafka or persistence with mocks.
+
+### Duplicate-delivery safety
+
+The test publishes the same `payments.created.v1` event twice and verifies that the Transaction Service persists exactly one `payment_transaction` and one `processed_events` record. This validates the idempotency boundary against a real database and broker.
+
+### Dead-letter recovery
+
+The test publishes malformed JSON to `payments.created.v1` and consumes from `payments.created.v1.DLT`, proving that the configured non-retryable failure path reaches the dead-letter topic with the original key and payload.
+
+### Schema migration
+
+The PostgreSQL container starts empty on every CI run. Flyway creates the transaction schema before Hibernate validation, which verifies that the migration scripts can bootstrap a fresh datastore.
+
 ## API
 
 ### Create a payment
@@ -117,6 +137,12 @@ Prerequisites: Java 17+, Maven, Docker.
 docker compose up -d
 mvn spring-boot:run -pl payment-service
 mvn spring-boot:run -pl transaction-service
+```
+
+Run all unit and container-backed integration tests:
+
+```bash
+mvn --batch-mode test
 ```
 
 Payment Service health:
@@ -159,6 +185,10 @@ The Transaction Service uses Spring Kafka's `DefaultErrorHandler` with a fixed 1
 
 Malformed payloads throw `IllegalArgumentException` and are classified as non-retryable, so they are routed to the DLT immediately rather than wasting retry capacity. DLT publishing is configured to surface send failures rather than silently treating recovery as successful.
 
+### Integration tests use production-like infrastructure
+
+Unit tests remain useful for fast business-logic feedback, but they cannot prove broker wiring, database migrations, listener acknowledgement behavior, or DLT publishing. The Testcontainers suite therefore boots real Kafka and PostgreSQL instances in CI and exercises the service across those boundaries.
+
 ### Service data ownership
 
 Payment and transaction records live in separate PostgreSQL databases. This keeps the services from reading or mutating each other's tables directly and makes Kafka the integration boundary between them.
@@ -177,13 +207,13 @@ The outbox relay polls small batches from PostgreSQL and publishes them synchron
 - [x] Separate service-owned transaction datastore
 - [x] Bounded Kafka retries
 - [x] Dead-letter topic recovery
+- [x] Testcontainers PostgreSQL + Kafka integration tests
 - [x] Base CI pipeline
 - [ ] Notification service
 - [ ] Audit service
 - [ ] Redis idempotency fast-path
 - [ ] OAuth2/JWT authentication
 - [ ] OpenAPI documentation
-- [ ] Testcontainers integration tests
 - [ ] OpenTelemetry + Prometheus/Grafana
 - [ ] DLT replay / operational recovery endpoint
 - [ ] Multi-instance outbox claiming with `SKIP LOCKED`
@@ -195,6 +225,7 @@ The outbox relay polls small batches from PostgreSQL and publishes them synchron
 **Backend:** Java 17, Spring Boot, Spring Data JPA, Spring Kafka  
 **Data:** PostgreSQL, Redis  
 **Messaging:** Apache Kafka  
+**Testing:** JUnit, Mockito, Testcontainers  
 **Infrastructure:** Docker Compose, GitHub Actions  
 **Observability:** Spring Boot Actuator (OpenTelemetry/Prometheus planned)
 
@@ -214,7 +245,9 @@ event-driven-payment-platform/
 │   │   ├── messaging/
 │   │   └── service/
 │   ├── src/main/resources/db/migration/
-│   └── src/test/
+│   └── src/test/java/com/charitha/transactions/
+│       ├── integration/
+│       └── service/
 ├── docs/
 ├── .github/workflows/ci.yml
 ├── docker-compose.yml
