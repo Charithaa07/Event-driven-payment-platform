@@ -25,22 +25,24 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class PaymentServiceTest {
+    private static final String CUSTOMER_ID = "customer-1";
+
     @Test
     void cachedIdempotencyResponseBypassesPostgres() {
         PaymentRepository repository = mock(PaymentRepository.class);
         OutboxEventRepository outboxRepository = mock(OutboxEventRepository.class);
         JsonMapper jsonMapper = mock(JsonMapper.class);
         RedisIdempotencyStore idempotencyStore = mock(RedisIdempotencyStore.class);
-        Payment existing = payment("req-123", "42.50");
+        Payment existing = payment("req-123", "42.50", CUSTOMER_ID);
 
-        when(idempotencyStore.findPayment("req-123")).thenReturn(Optional.of(existing));
+        when(idempotencyStore.findPayment(CUSTOMER_ID, "req-123")).thenReturn(Optional.of(existing));
 
         PaymentService service = new PaymentService(repository, outboxRepository, jsonMapper, idempotencyStore);
-        Payment result = service.create("req-123", request("42.50"));
+        Payment result = service.create("req-123", request("42.50"), CUSTOMER_ID);
 
         assertEquals(existing, result);
         verifyNoInteractions(repository, outboxRepository, jsonMapper);
-        verify(idempotencyStore, never()).put(any(), any());
+        verify(idempotencyStore, never()).put(any(), any(), any());
     }
 
     @Test
@@ -49,47 +51,49 @@ class PaymentServiceTest {
         OutboxEventRepository outboxRepository = mock(OutboxEventRepository.class);
         JsonMapper jsonMapper = mock(JsonMapper.class);
         RedisIdempotencyStore idempotencyStore = mock(RedisIdempotencyStore.class);
-        Payment existing = payment("req-123", "42.50");
+        Payment existing = payment("req-123", "42.50", CUSTOMER_ID);
 
-        when(idempotencyStore.findPayment("req-123")).thenReturn(Optional.empty());
-        when(repository.findByIdempotencyKey("req-123")).thenReturn(Optional.of(existing));
+        when(idempotencyStore.findPayment(CUSTOMER_ID, "req-123")).thenReturn(Optional.empty());
+        when(repository.findByCustomerIdAndIdempotencyKey(CUSTOMER_ID, "req-123"))
+                .thenReturn(Optional.of(existing));
 
         PaymentService service = new PaymentService(repository, outboxRepository, jsonMapper, idempotencyStore);
-        Payment result = service.create("req-123", request("42.50"));
+        Payment result = service.create("req-123", request("42.50"), CUSTOMER_ID);
 
         assertEquals(existing, result);
-        verify(idempotencyStore).put("req-123", existing);
+        verify(idempotencyStore).put(CUSTOMER_ID, "req-123", existing);
         verify(repository, never()).insertIfAbsent(any(), any(), any(), any(), any(), any(), any());
         verifyNoInteractions(outboxRepository, jsonMapper);
     }
 
     @Test
-    void newPaymentCreatesOutboxAndCachesAfterCreationPathCompletes() throws Exception {
+    void newPaymentUsesAuthenticatedCustomerCreatesOutboxAndCaches() throws Exception {
         PaymentRepository repository = mock(PaymentRepository.class);
         OutboxEventRepository outboxRepository = mock(OutboxEventRepository.class);
         JsonMapper jsonMapper = mock(JsonMapper.class);
         RedisIdempotencyStore idempotencyStore = mock(RedisIdempotencyStore.class);
 
-        when(idempotencyStore.findPayment("req-new")).thenReturn(Optional.empty());
-        when(repository.findByIdempotencyKey("req-new")).thenReturn(Optional.empty());
-        when(repository.insertIfAbsent(any(), eq("req-new"), any(), eq("USD"), eq("customer-1"), eq("ACCEPTED"), any()))
+        when(idempotencyStore.findPayment(CUSTOMER_ID, "req-new")).thenReturn(Optional.empty());
+        when(repository.findByCustomerIdAndIdempotencyKey(CUSTOMER_ID, "req-new")).thenReturn(Optional.empty());
+        when(repository.insertIfAbsent(any(), eq("req-new"), any(), eq("USD"), eq(CUSTOMER_ID), eq("ACCEPTED"), any()))
                 .thenReturn(1);
         when(jsonMapper.writeValueAsString(any())).thenReturn("{}");
 
         PaymentService service = new PaymentService(repository, outboxRepository, jsonMapper, idempotencyStore);
-        Payment result = service.create("req-new", request("42.50"));
+        Payment result = service.create("req-new", request("42.50"), CUSTOMER_ID);
 
+        assertEquals(CUSTOMER_ID, result.getCustomerId());
         verify(repository).insertIfAbsent(
                 eq(result.getId()),
                 eq("req-new"),
                 eq(new BigDecimal("42.50")),
                 eq("USD"),
-                eq("customer-1"),
+                eq(CUSTOMER_ID),
                 eq("ACCEPTED"),
                 any()
         );
         verify(outboxRepository).save(any());
-        verify(idempotencyStore).put("req-new", result);
+        verify(idempotencyStore).put(CUSTOMER_ID, "req-new", result);
     }
 
     @Test
@@ -98,21 +102,21 @@ class PaymentServiceTest {
         OutboxEventRepository outboxRepository = mock(OutboxEventRepository.class);
         JsonMapper jsonMapper = mock(JsonMapper.class);
         RedisIdempotencyStore idempotencyStore = mock(RedisIdempotencyStore.class);
-        Payment winner = payment("req-race", "42.50");
+        Payment winner = payment("req-race", "42.50", CUSTOMER_ID);
 
-        when(idempotencyStore.findPayment("req-race")).thenReturn(Optional.empty());
-        when(repository.findByIdempotencyKey("req-race"))
+        when(idempotencyStore.findPayment(CUSTOMER_ID, "req-race")).thenReturn(Optional.empty());
+        when(repository.findByCustomerIdAndIdempotencyKey(CUSTOMER_ID, "req-race"))
                 .thenReturn(Optional.empty())
                 .thenReturn(Optional.of(winner));
-        when(repository.insertIfAbsent(any(), eq("req-race"), any(), any(), any(), any(), any()))
+        when(repository.insertIfAbsent(any(), eq("req-race"), any(), any(), eq(CUSTOMER_ID), any(), any()))
                 .thenReturn(0);
 
         PaymentService service = new PaymentService(repository, outboxRepository, jsonMapper, idempotencyStore);
-        Payment result = service.create("req-race", request("42.50"));
+        Payment result = service.create("req-race", request("42.50"), CUSTOMER_ID);
 
         assertEquals(winner, result);
         verifyNoInteractions(outboxRepository, jsonMapper);
-        verify(idempotencyStore).put("req-race", winner);
+        verify(idempotencyStore).put(CUSTOMER_ID, "req-race", winner);
     }
 
     @Test
@@ -121,30 +125,61 @@ class PaymentServiceTest {
         OutboxEventRepository outboxRepository = mock(OutboxEventRepository.class);
         JsonMapper jsonMapper = mock(JsonMapper.class);
         RedisIdempotencyStore idempotencyStore = mock(RedisIdempotencyStore.class);
-        Payment existing = payment("req-conflict", "42.50");
+        Payment existing = payment("req-conflict", "42.50", CUSTOMER_ID);
 
-        when(idempotencyStore.findPayment("req-conflict")).thenReturn(Optional.of(existing));
+        when(idempotencyStore.findPayment(CUSTOMER_ID, "req-conflict")).thenReturn(Optional.of(existing));
 
         PaymentService service = new PaymentService(repository, outboxRepository, jsonMapper, idempotencyStore);
 
         assertThrows(
                 IdempotencyConflictException.class,
-                () -> service.create("req-conflict", request("99.00"))
+                () -> service.create("req-conflict", request("99.00"), CUSTOMER_ID)
         );
         verifyNoInteractions(repository, outboxRepository, jsonMapper);
     }
 
-    private CreatePaymentRequest request(String amount) {
-        return new CreatePaymentRequest(new BigDecimal(amount), "USD", "customer-1");
+    @Test
+    void paymentLookupIsScopedToAuthenticatedCustomer() {
+        PaymentRepository repository = mock(PaymentRepository.class);
+        OutboxEventRepository outboxRepository = mock(OutboxEventRepository.class);
+        JsonMapper jsonMapper = mock(JsonMapper.class);
+        RedisIdempotencyStore idempotencyStore = mock(RedisIdempotencyStore.class);
+        UUID paymentId = UUID.randomUUID();
+        Payment existing = payment("req-owned", "42.50", CUSTOMER_ID);
+
+        when(repository.findByIdAndCustomerId(paymentId, CUSTOMER_ID)).thenReturn(Optional.of(existing));
+
+        PaymentService service = new PaymentService(repository, outboxRepository, jsonMapper, idempotencyStore);
+        assertEquals(existing, service.get(paymentId, CUSTOMER_ID));
+
+        verify(repository).findByIdAndCustomerId(paymentId, CUSTOMER_ID);
     }
 
-    private Payment payment(String idempotencyKey, String amount) {
+    @Test
+    void invalidAuthenticatedSubjectIsRejectedBeforePersistence() {
+        PaymentRepository repository = mock(PaymentRepository.class);
+        OutboxEventRepository outboxRepository = mock(OutboxEventRepository.class);
+        JsonMapper jsonMapper = mock(JsonMapper.class);
+        RedisIdempotencyStore idempotencyStore = mock(RedisIdempotencyStore.class);
+        PaymentService service = new PaymentService(repository, outboxRepository, jsonMapper, idempotencyStore);
+
+        assertThrows(IllegalArgumentException.class, () -> service.create("req", request("42.50"), " "));
+        assertThrows(IllegalArgumentException.class, () -> service.create("req", request("42.50"), "x".repeat(121)));
+
+        verifyNoInteractions(repository, outboxRepository, jsonMapper, idempotencyStore);
+    }
+
+    private CreatePaymentRequest request(String amount) {
+        return new CreatePaymentRequest(new BigDecimal(amount), "USD");
+    }
+
+    private Payment payment(String idempotencyKey, String amount, String customerId) {
         return new Payment(
                 UUID.randomUUID(),
                 idempotencyKey,
                 new BigDecimal(amount),
                 "USD",
-                "customer-1",
+                customerId,
                 PaymentStatus.ACCEPTED,
                 Instant.now()
         );

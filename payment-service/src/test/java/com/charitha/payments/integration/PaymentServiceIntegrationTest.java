@@ -12,10 +12,15 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.http.MediaType;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.context.WebApplicationContext;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -31,12 +36,20 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
+import static org.springframework.security.test.web.servlet.setup.SecurityMockMvcConfigurers.springSecurity;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @Testcontainers
 @SpringBootTest(properties = "outbox.relay.enabled=false")
 class PaymentServiceIntegrationTest {
+    private static final String CUSTOMER_ID = "customer-1";
 
     @Container
     @ServiceConnection
@@ -70,10 +83,18 @@ class PaymentServiceIntegrationTest {
     @Autowired
     private PlatformTransactionManager transactionManager;
 
+    @Autowired
+    private WebApplicationContext webApplicationContext;
+
+    private MockMvc mockMvc;
+
     @BeforeEach
-    void cleanDatabase() {
+    void setUp() {
         outboxRepository.deleteAll();
         paymentRepository.deleteAll();
+        mockMvc = MockMvcBuilders.webAppContextSetup(webApplicationContext)
+                .apply(springSecurity())
+                .build();
     }
 
     @Test
@@ -85,8 +106,8 @@ class PaymentServiceIntegrationTest {
         ExecutorService executor = Executors.newFixedThreadPool(2);
 
         try {
-            Future<Payment> first = executor.submit(() -> createAfterBarrier(key, request, ready, start));
-            Future<Payment> second = executor.submit(() -> createAfterBarrier(key, request, ready, start));
+            Future<Payment> first = executor.submit(() -> createAfterBarrier(key, request, CUSTOMER_ID, ready, start));
+            Future<Payment> second = executor.submit(() -> createAfterBarrier(key, request, CUSTOMER_ID, ready, start));
 
             assertTrue(ready.await(5, TimeUnit.SECONDS));
             start.countDown();
@@ -104,17 +125,29 @@ class PaymentServiceIntegrationTest {
     }
 
     @Test
-    void sameKeyWithDifferentRequestIsRejected() {
+    void sameKeyWithDifferentRequestIsRejectedForSameCustomer() {
         String key = "conflict-" + UUID.randomUUID();
 
-        paymentService.create(key, request("42.50"));
+        paymentService.create(key, request("42.50"), CUSTOMER_ID);
 
         assertThrows(
                 IdempotencyConflictException.class,
-                () -> paymentService.create(key, request("99.00"))
+                () -> paymentService.create(key, request("99.00"), CUSTOMER_ID)
         );
         assertEquals(1L, paymentRepository.count());
         assertEquals(1L, outboxRepository.count());
+    }
+
+    @Test
+    void sameIdempotencyKeyCanBeUsedByDifferentCustomers() {
+        String sharedKey = "shared-" + UUID.randomUUID();
+
+        Payment first = paymentService.create(sharedKey, request("42.50"), "customer-a");
+        Payment second = paymentService.create(sharedKey, request("42.50"), "customer-b");
+
+        assertNotEquals(first.getId(), second.getId());
+        assertEquals(2L, paymentRepository.count());
+        assertEquals(2L, outboxRepository.count());
     }
 
     @Test
@@ -123,14 +156,14 @@ class PaymentServiceIntegrationTest {
         TransactionTemplate template = new TransactionTemplate(transactionManager);
 
         template.executeWithoutResult(status -> {
-            paymentService.create(key, request("42.50"));
-            assertTrue(idempotencyStore.findPayment(key).isEmpty());
+            paymentService.create(key, request("42.50"), CUSTOMER_ID);
+            assertTrue(idempotencyStore.findPayment(CUSTOMER_ID, key).isEmpty());
             status.setRollbackOnly();
         });
 
-        assertTrue(paymentRepository.findByIdempotencyKey(key).isEmpty());
+        assertTrue(paymentRepository.findByCustomerIdAndIdempotencyKey(CUSTOMER_ID, key).isEmpty());
         assertEquals(0L, outboxRepository.count());
-        assertTrue(idempotencyStore.findPayment(key).isEmpty());
+        assertTrue(idempotencyStore.findPayment(CUSTOMER_ID, key).isEmpty());
     }
 
     @Test
@@ -138,29 +171,111 @@ class PaymentServiceIntegrationTest {
         String key = "commit-" + UUID.randomUUID();
         TransactionTemplate template = new TransactionTemplate(transactionManager);
 
-        Payment created = paymentService.create(key, request("42.50"));
+        Payment created = paymentService.create(key, request("42.50"), CUSTOMER_ID);
 
         assertTrue(paymentRepository.findById(created.getId()).isPresent());
         assertEquals(1L, outboxRepository.count());
-        Payment cached = idempotencyStore.findPayment(key).orElseThrow();
+        Payment cached = idempotencyStore.findPayment(CUSTOMER_ID, key).orElseThrow();
         assertEquals(created.getId(), cached.getId());
 
         Integer claimableCount = template.execute(status -> outboxRepository.findClaimableBatch().size());
         assertEquals(1, claimableCount);
     }
 
+    @Test
+    void unauthenticatedPaymentCreationReturns401() throws Exception {
+        mockMvc.perform(post("/api/v1/payments")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Idempotency-Key", "http-unauthenticated")
+                        .content("{\"amount\":42.50,\"currency\":\"USD\"}"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void tokenWithoutWriteScopeReturns403() throws Exception {
+        mockMvc.perform(post("/api/v1/payments")
+                        .with(jwt()
+                                .jwt(token -> token.subject("customer-http"))
+                                .authorities(new SimpleGrantedAuthority("SCOPE_payments:read")))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Idempotency-Key", "http-wrong-scope")
+                        .content("{\"amount\":42.50,\"currency\":\"USD\"}"))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void authenticatedCustomerIdentityComesFromJwtSubject() throws Exception {
+        String key = "http-create-" + UUID.randomUUID();
+
+        mockMvc.perform(post("/api/v1/payments")
+                        .with(jwt()
+                                .jwt(token -> token.subject("customer-http"))
+                                .authorities(new SimpleGrantedAuthority("SCOPE_payments:write")))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Idempotency-Key", key)
+                        .content("{\"amount\":42.50,\"currency\":\"USD\",\"customerId\":\"spoofed-customer\"}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.customerId").value("customer-http"));
+
+        Payment persisted = paymentRepository.findByCustomerIdAndIdempotencyKey("customer-http", key).orElseThrow();
+        assertEquals("customer-http", persisted.getCustomerId());
+    }
+
+    @Test
+    void paymentReadRequiresReadScopeAndOwnership() throws Exception {
+        Payment created = paymentService.create("http-read-" + UUID.randomUUID(), request("42.50"), CUSTOMER_ID);
+
+        mockMvc.perform(get("/api/v1/payments/{paymentId}", created.getId())
+                        .with(jwt()
+                                .jwt(token -> token.subject(CUSTOMER_ID))
+                                .authorities(new SimpleGrantedAuthority("SCOPE_payments:read"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(created.getId().toString()));
+
+        mockMvc.perform(get("/api/v1/payments/{paymentId}", created.getId())
+                        .with(jwt()
+                                .jwt(token -> token.subject("different-customer"))
+                                .authorities(new SimpleGrantedAuthority("SCOPE_payments:read"))))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void healthEndpointRemainsPublicForProbes() throws Exception {
+        mockMvc.perform(get("/actuator/health"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void metricsRequireOpsReadScope() throws Exception {
+        mockMvc.perform(get("/actuator/metrics"))
+                .andExpect(status().isUnauthorized());
+
+        mockMvc.perform(get("/actuator/metrics")
+                        .with(jwt()
+                                .jwt(token -> token.subject("operator-1"))
+                                .authorities(new SimpleGrantedAuthority("SCOPE_payments:read"))))
+                .andExpect(status().isForbidden());
+
+        mockMvc.perform(get("/actuator/metrics")
+                        .with(jwt()
+                                .jwt(token -> token.subject("operator-1"))
+                                .authorities(new SimpleGrantedAuthority("SCOPE_ops:read"))))
+                .andExpect(status().isOk());
+    }
+
     private Payment createAfterBarrier(String key,
                                        CreatePaymentRequest request,
+                                       String customerId,
                                        CountDownLatch ready,
                                        CountDownLatch start) throws Exception {
         ready.countDown();
         if (!start.await(5, TimeUnit.SECONDS)) {
             throw new IllegalStateException("Timed out waiting for concurrent request barrier");
         }
-        return paymentService.create(key, request);
+        return paymentService.create(key, request, customerId);
     }
 
     private CreatePaymentRequest request(String amount) {
-        return new CreatePaymentRequest(new BigDecimal(amount), "USD", "customer-1");
+        return new CreatePaymentRequest(new BigDecimal(amount), "USD");
     }
 }

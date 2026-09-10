@@ -16,8 +16,7 @@ class CreatePaymentRequestValidationTest {
     void validPaymentRequestPassesValidation() {
         CreatePaymentRequest request = new CreatePaymentRequest(
                 new BigDecimal("42.50"),
-                "USD",
-                "customer-1"
+                "USD"
         );
 
         assertTrue(validator.validate(request).isEmpty());
@@ -27,13 +26,11 @@ class CreatePaymentRequestValidationTest {
     void rejectsMoneyBeyondDatabasePrecisionAndScale() {
         CreatePaymentRequest excessiveScale = new CreatePaymentRequest(
                 new BigDecimal("42.501"),
-                "USD",
-                "customer-1"
+                "USD"
         );
         CreatePaymentRequest excessiveIntegerDigits = new CreatePaymentRequest(
                 new BigDecimal("123456789012345678.00"),
-                "USD",
-                "customer-1"
+                "USD"
         );
 
         assertFalse(validator.validate(excessiveScale).isEmpty());
@@ -41,13 +38,8 @@ class CreatePaymentRequestValidationTest {
     }
 
     @Test
-    void rejectsCustomerIdBeyondDatabaseColumnLength() {
-        CreatePaymentRequest request = new CreatePaymentRequest(
-                new BigDecimal("42.50"),
-                "USD",
-                "x".repeat(121)
-        );
-
-        assertFalse(validator.validate(request).isEmpty());
+    void rejectsInvalidCurrencyCode() {
+        assertFalse(validator.validate(new CreatePaymentRequest(new BigDecimal("42.50"), "usd")).isEmpty());
+        assertFalse(validator.validate(new CreatePaymentRequest(new BigDecimal("42.50"), "US")).isEmpty());
     }
 }

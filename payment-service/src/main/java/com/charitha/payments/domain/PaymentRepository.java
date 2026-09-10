@@ -11,7 +11,9 @@ import java.util.Optional;
 import java.util.UUID;
 
 public interface PaymentRepository extends JpaRepository<Payment, UUID> {
-    Optional<Payment> findByIdempotencyKey(String idempotencyKey);
+    Optional<Payment> findByCustomerIdAndIdempotencyKey(String customerId, String idempotencyKey);
+
+    Optional<Payment> findByIdAndCustomerId(UUID id, String customerId);
 
     @Modifying
     @Query(value = """
@@ -20,7 +22,7 @@ public interface PaymentRepository extends JpaRepository<Payment, UUID> {
             ) VALUES (
                 :id, :idempotencyKey, :amount, :currency, :customerId, :status, :createdAt
             )
-            ON CONFLICT (idempotency_key) DO NOTHING
+            ON CONFLICT (customer_id, idempotency_key) DO NOTHING
             """, nativeQuery = true)
     int insertIfAbsent(@Param("id") UUID id,
                        @Param("idempotencyKey") String idempotencyKey,

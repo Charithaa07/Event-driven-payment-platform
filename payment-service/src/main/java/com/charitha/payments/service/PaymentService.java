@@ -39,39 +39,44 @@ public class PaymentService {
     }
 
     @Transactional
-    public Payment create(String idempotencyKey, CreatePaymentRequest request) {
-        Optional<Payment> cachedPayment = idempotencyStore.findPayment(idempotencyKey);
+    public Payment create(String idempotencyKey, CreatePaymentRequest request, String customerId) {
+        validateCustomerId(customerId);
+
+        Optional<Payment> cachedPayment = idempotencyStore.findPayment(customerId, idempotencyKey);
         if (cachedPayment.isPresent()) {
             Payment payment = cachedPayment.get();
-            assertSameRequest(payment, request, idempotencyKey);
+            assertSameRequest(payment, request, customerId, idempotencyKey);
             return payment;
         }
 
-        Optional<Payment> persistedPayment = repository.findByIdempotencyKey(idempotencyKey);
+        Optional<Payment> persistedPayment = repository.findByCustomerIdAndIdempotencyKey(customerId, idempotencyKey);
         if (persistedPayment.isPresent()) {
             Payment payment = persistedPayment.get();
-            assertSameRequest(payment, request, idempotencyKey);
-            idempotencyStore.put(idempotencyKey, payment);
+            assertSameRequest(payment, request, customerId, idempotencyKey);
+            idempotencyStore.put(customerId, idempotencyKey, payment);
             return payment;
         }
 
-        return createOrResolveConcurrentRequest(idempotencyKey, request);
+        return createOrResolveConcurrentRequest(idempotencyKey, request, customerId);
     }
 
     @Transactional(readOnly = true)
-    public Payment get(UUID paymentId) {
-        return repository.findById(paymentId)
+    public Payment get(UUID paymentId, String customerId) {
+        validateCustomerId(customerId);
+        return repository.findByIdAndCustomerId(paymentId, customerId)
                 .orElseThrow(() -> new PaymentNotFoundException(paymentId));
     }
 
-    private Payment createOrResolveConcurrentRequest(String idempotencyKey, CreatePaymentRequest request) {
+    private Payment createOrResolveConcurrentRequest(String idempotencyKey,
+                                                     CreatePaymentRequest request,
+                                                     String customerId) {
         Instant now = Instant.now();
         Payment candidate = new Payment(
                 UUID.randomUUID(),
                 idempotencyKey,
                 request.amount(),
                 request.currency(),
-                request.customerId(),
+                customerId,
                 PaymentStatus.ACCEPTED,
                 now
         );
@@ -87,12 +92,12 @@ public class PaymentService {
         );
 
         if (inserted == 0) {
-            Payment existing = repository.findByIdempotencyKey(idempotencyKey)
+            Payment existing = repository.findByCustomerIdAndIdempotencyKey(customerId, idempotencyKey)
                     .orElseThrow(() -> new IllegalStateException(
                             "Idempotency conflict was detected but the winning payment could not be loaded"
                     ));
-            assertSameRequest(existing, request, idempotencyKey);
-            idempotencyStore.put(idempotencyKey, existing);
+            assertSameRequest(existing, request, customerId, idempotencyKey);
+            idempotencyStore.put(customerId, idempotencyKey, existing);
             return existing;
         }
 
@@ -115,34 +120,41 @@ public class PaymentService {
                 now
         ));
 
-        cacheAfterCommit(idempotencyKey, candidate);
+        cacheAfterCommit(customerId, idempotencyKey, candidate);
         return candidate;
     }
 
     private void assertSameRequest(Payment payment,
                                    CreatePaymentRequest request,
+                                   String customerId,
                                    String idempotencyKey) {
         boolean sameAmount = payment.getAmount().compareTo(request.amount()) == 0;
         boolean sameCurrency = payment.getCurrency().equals(request.currency());
-        boolean sameCustomer = payment.getCustomerId().equals(request.customerId());
+        boolean sameCustomer = payment.getCustomerId().equals(customerId);
 
         if (!sameAmount || !sameCurrency || !sameCustomer) {
             throw new IdempotencyConflictException(idempotencyKey);
         }
     }
 
-    private void cacheAfterCommit(String idempotencyKey, Payment payment) {
+    private void cacheAfterCommit(String customerId, String idempotencyKey, Payment payment) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            idempotencyStore.put(idempotencyKey, payment);
+            idempotencyStore.put(customerId, idempotencyKey, payment);
             return;
         }
 
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                idempotencyStore.put(idempotencyKey, payment);
+                idempotencyStore.put(customerId, idempotencyKey, payment);
             }
         });
+    }
+
+    private void validateCustomerId(String customerId) {
+        if (customerId == null || customerId.isBlank() || customerId.length() > 120) {
+            throw new IllegalArgumentException("Authenticated customer subject is invalid");
+        }
     }
 
     private String serialize(PaymentCreatedEvent event) {
