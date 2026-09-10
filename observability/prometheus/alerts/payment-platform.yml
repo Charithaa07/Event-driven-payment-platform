@@ -1,0 +1,79 @@
+groups:
+  - name: payment-platform-slo-signals
+    rules:
+      - alert: PaymentApiHigh5xxRate
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="payment-service",uri=~"/api/v1/payments.*",status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_server_requests_seconds_count{service="payment-service",uri=~"/api/v1/payments.*"}[5m])), 0.001)
+          ) > 0.01
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Payment API 5xx rate is above 1%
+          description: Payment API server errors have remained above the short-window reliability threshold for 10 minutes.
+
+      - alert: PaymentApiHighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(http_server_requests_seconds_bucket{service="payment-service",uri=~"/api/v1/payments.*"}[5m])
+            )
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Payment API p95 latency is above 500 ms
+          description: Server-side payment API latency has remained above the reference p95 target for 10 minutes.
+
+      - alert: PaymentOutboxEventAgeHigh
+        expr: payments_outbox_oldest_age_seconds{service="payment-service"} > 30
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Oldest unpublished payment event is over 30 seconds old
+          description: The payment outbox is not draining within the reference freshness objective.
+
+      - alert: PaymentOutboxTerminalFailures
+        expr: payments_outbox_events{service="payment-service",status="failed"} > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Payment outbox contains terminal failed rows
+          description: At least one outbox event exhausted publication retries and requires operator investigation.
+
+      - alert: TransactionDltActivity
+        expr: increase(transactions_kafka_dlt_total{service="transaction-service"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Transaction Service produced dead-letter records
+          description: Retry recovery was exhausted or an invalid payment event reached the transaction DLT.
+
+      - alert: NotificationTerminalFailures
+        expr: increase(notifications_delivery_attempts_total{service="notification-service",outcome="failed"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Notification delivery reached terminal failure
+          description: At least one provider delivery exhausted retries or failed permanently in the last 15 minutes.
+
+      - alert: DatabaseConnectionPoolSaturation
+        expr: |
+          (
+            hikaricp_connections_active
+            /
+            clamp_min(hikaricp_connections_max, 1)
+          ) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Database connection pool is above 85% utilization
+          description: A service has sustained high Hikari connection utilization and may be approaching database capacity pressure.

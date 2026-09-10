@@ -1,8 +1,8 @@
 # Event-Driven Payment Platform
 
-A portfolio-grade payment backend built to demonstrate production concerns beyond CRUD: **authenticated APIs, concurrency-safe idempotency, transactional messaging, at-least-once delivery, consumer deduplication, bounded recovery, operational replay, immutable audit evidence, asynchronous provider delivery, observability, container hardening, Kubernetes deployment, and AWS infrastructure as code**.
+A portfolio-grade distributed payment backend built to demonstrate production concerns beyond CRUD: **authenticated APIs, concurrency-safe idempotency, transactional messaging, at-least-once delivery, consumer deduplication, bounded recovery, operational replay, immutable audit evidence, asynchronous provider delivery, observability, performance/resilience testing, Kubernetes deployment, and AWS infrastructure as code**.
 
-> Status: **Phase 14** — Payment, Transaction, Audit, and Notification run as independent Spring Boot services with separate datastores. The repository now includes hardened containers, Kubernetes/Helm packaging, a validated AWS Terraform reference architecture, EKS Pod Identity workload roles, managed RDS/MSK/ElastiCache mappings, and an opt-in GitHub OIDC deployment workflow. No AWS infrastructure is created automatically by CI.
+> Status: **Phase 15** — four independently owned Spring Boot services are implemented with PostgreSQL/Redis/Kafka correctness boundaries, OAuth2/JWT, OpenAPI, Prometheus/OpenTelemetry, Testcontainers, Helm, validated AWS Terraform, and an executable performance/resilience verification layer. AWS infrastructure is not automatically created by CI, and load-test thresholds are engineering targets rather than pre-claimed production benchmarks.
 
 ## Architecture
 
@@ -43,59 +43,54 @@ flowchart LR
 ### AWS production mapping
 
 ```text
-GitHub Actions
-     |
-     | OIDC -> short-lived deploy role
-     v
-Amazon ECR
-     |
-     | immutable images
-     v
-Amazon EKS (private app subnets)
-     |
-     +--> Payment Service ------> RDS PostgreSQL (payments)
-     |       |                   ElastiCache Serverless Redis
-     |       `-----------------> MSK Serverless (IAM)
-     |
-     +--> Transaction Service --> RDS PostgreSQL (transactions)
-     |       `-----------------> MSK Serverless (IAM)
-     |
-     +--> Audit Service --------> RDS PostgreSQL (audit)
-     |       `-----------------> MSK Serverless (IAM)
-     |
-     `--> Notification Service -> RDS PostgreSQL (notifications)
-             `-----------------> MSK Serverless (IAM)
+GitHub Actions --OIDC--> short-lived AWS deploy role
+                              |
+                              v
+                         Amazon ECR
+                              |
+                              v
+                    Amazon EKS / Helm
+           +------------------+------------------+
+           |                  |                  |
+     Payment pod       Transaction pod     Audit / Notification pods
+       |      \               |                    |
+       |       \              +--------------------+
+       |        \                                  |
+   RDS payments  ElastiCache Redis            MSK Serverless
+       |                                           IAM/SASL
+       +--------------------------------------------+
 
 Each workload ServiceAccount -> EKS Pod Identity -> dedicated IAM role
+Each service -> separate RDS PostgreSQL datastore
 ```
 
-Terraform owns the AWS reference infrastructure. Helm owns application workloads and runtime configuration. Stateful application dependencies remain managed AWS services rather than being installed inside EKS.
+Terraform owns the AWS reference infrastructure. Helm owns application workloads and runtime configuration. Stateful dependencies are mapped to managed AWS services rather than installed inside EKS.
 
 ## Engineering highlights
 
 - **Java 17 + Spring Boot 4** multi-service Maven project
-- **OAuth2/JWT Resource Servers** with JWKS signature validation, issuer/audience/timing checks, and scope authorization
+- **OAuth2/JWT Resource Servers** with JWKS signature, issuer, audience, timing, subject, ownership, and scope checks
 - Customer-scoped PostgreSQL + Redis idempotency with `Idempotency-Key`
-- Concurrency-safe payment creation using PostgreSQL conflict handling
-- **Transactional outbox** so payment state and event intent commit atomically
-- Multi-instance outbox relay using `FOR UPDATE SKIP LOCKED`, leases, retry backoff, and terminal failure state
+- Concurrency-safe first-writer handling with PostgreSQL as the final durability boundary
+- **Transactional outbox** committing payment state and event intent atomically
+- Multi-instance outbox relay using `FOR UPDATE SKIP LOCKED`, leases, bounded retry/backoff, and terminal failure state
 - Independent Kafka consumer groups for Transaction, Audit, and Notification
-- Transaction consumer idempotency with durable `processed_events`
-- Bounded Kafka retries, DLT indexing, and secured operational replay
-- Append-only Audit Service records with SHA-256 integrity verification
-- Notification ingestion deduplication plus leased asynchronous provider dispatch
-- Provider retry/backoff, terminal delivery state, and stable provider idempotency keys
+- Durable consumer idempotency, bounded Kafka retries, DLT indexing, and secured replay
+- Append-only Audit Service evidence with SHA-256 integrity verification and database-enforced immutability
+- Notification ingestion deduplication plus leased provider dispatch with retry/backoff and stable provider idempotency keys
 - Runtime-generated **OpenAPI + Swagger UI**
-- **Prometheus + Micrometer + OpenTelemetry/OTLP + Grafana + Tempo**
-- Testcontainers verification with real PostgreSQL, Redis, and Kafka
-- Reusable non-root JVM Docker image with memory-aware JVM settings
-- **Helm-managed Kubernetes Deployments, Services, HPAs, PDBs, ConfigMap/Secret boundaries, probes, rolling updates, and optional Ingress**
-- **Terraform-managed AWS reference architecture** spanning two AZs with EKS, ECR, four RDS PostgreSQL datastores, MSK Serverless, ElastiCache Serverless Redis, IAM, and CloudWatch control-plane logs
-- **EKS Pod Identity** gives each workload a distinct IAM role for MSK instead of static cloud credentials
-- **GitHub Actions OIDC** provides short-lived deployment credentials and an immutable ECR -> Helm -> EKS release path
-- CI validates observability configuration, Terraform formatting/provider schemas, generic + AWS Helm rendering, the Maven reactor, and all four runtime images
+- **Prometheus + Micrometer + OpenTelemetry/OTLP + Tempo + Grafana**
+- Real PostgreSQL, Redis, and Kafka **Testcontainers** integration tests
+- **k6 performance profiles** for mixed payment traffic and hot-key idempotent retries
+- Container-backed eight-way simultaneous first-writer contention verification
+- Local Redis failure and Kafka-outage/outbox-recovery drills with safety guards
+- Reference SLOs plus validated Prometheus alert rules for API, outbox, DLT, notification, and DB-pool signals
+- Hardened non-root JVM runtime image
+- **Kubernetes/Helm** Deployments, Services, HPAs, PDBs, probes, rolling updates, ConfigMap/Secret boundaries, and optional Ingress
+- **AWS Terraform** for EKS, ECR, four RDS PostgreSQL datastores, MSK Serverless, ElastiCache Serverless Redis, Pod Identity, GitHub OIDC, and CloudWatch control-plane logs
+- CI validates performance/observability assets, Terraform provider schemas, generic + AWS Helm rendering, the Maven reactor, and four runtime images
 
-## Core payment flow
+## Core payment correctness
 
 ```text
 Authenticated customer + Idempotency-Key
@@ -116,73 +111,67 @@ INSERT ... ON CONFLICT DO NOTHING
   `-- loser  --> load winner and return same result
 ```
 
-The outbox relay claims rows with `FOR UPDATE SKIP LOCKED`, commits the short claim transaction, then publishes to Kafka. Delivery remains intentionally **at least once**, so downstream services keep durable idempotency boundaries.
+Redis is deliberately a fail-open optimization; PostgreSQL remains authoritative. New cache entries are written only after the payment transaction commits.
 
-## Transaction and DLT recovery
+The outbox relay claims rows with `FOR UPDATE SKIP LOCKED`, commits the short claim transaction, and publishes to Kafka outside that transaction. Publication remains **at least once**, so downstream consumers keep durable idempotency boundaries.
 
-Transaction Service consumes `payments.created.v1`, writes the business transaction and `processed_events` marker atomically, and ignores duplicate event IDs. Retryable failures receive bounded retry; exhausted or malformed records move to the transaction DLT.
+## Downstream services
 
-The DLT is indexed durably for operations. `ops:read` permits inspection and `ops:write` permits replay. Replay uses a leased `REPLAYING` claim and publishes outside the database transaction. A crash after Kafka acknowledgment can still duplicate a replay, which is safe because transaction processing remains idempotent.
+**Transaction Service** consumes `payments.created.v1`, writes the business transaction and `processed_events` marker atomically, ignores duplicate event IDs, applies bounded Kafka retry, durably indexes its DLT, and exposes secured operator replay.
 
-## Immutable Audit Service
+**Audit Service** independently consumes the event stream and preserves immutable integration-boundary evidence with event identity, Kafka source position, original payload, timestamps, and a SHA-256 digest. PostgreSQL rejects audit `UPDATE`/`DELETE` operations.
 
-Audit Service independently consumes the same payment event stream. Event ID is the logical idempotency key, Kafka source position is independently unique, and PostgreSQL rejects `UPDATE` and `DELETE` on audit records. Detail reads recompute the stored SHA-256 integrity digest.
+**Notification Service** creates one durable delivery request per `(source_event_id, channel)`. A leased `FOR UPDATE SKIP LOCKED` dispatcher performs provider calls outside its claim transaction and persists `PENDING -> PROCESSING -> RETRY_PENDING -> SENT/FAILED` state. End-to-end exactly-once provider delivery is not claimed.
 
-## Asynchronous Notification Service
+## Performance and resilience engineering
 
-Notification Service converts each logical payment event into one durable EMAIL delivery request. A unique `(source_event_id, channel)` constraint makes event replay idempotent.
+Phase 15 adds an executable verification layer rather than a hard-coded throughput claim.
 
-```text
-payments.created.v1
-        |
-        v
-Notification consumer
-        |
-        v
-Notification DB: PENDING
-        |
-        v
-FOR UPDATE SKIP LOCKED claim
-        |
-        v
-Provider call outside DB transaction
-   | success             -> SENT
-   | retryable failure   -> RETRY_PENDING + backoff
-   ` permanent/exhausted -> FAILED
-```
+### Mixed load
 
-Kafka ingestion and external provider delivery are separate failure domains. A `PROCESSING` lease allows another replica to reclaim abandoned work. Because a crash can occur after a provider accepts a message but before `SENT` is persisted, the stable notification ID is forwarded as the provider idempotency key. End-to-end exactly-once provider delivery is deliberately not claimed.
+`performance/k6/payment-api.js` drives a configurable constant arrival rate of unique payment creates, same-key retries, and authenticated reads. It verifies response correctness and exposes threshold targets for request failures and p95/p99 latency.
 
-## API and authorization
+### Idempotency contention
+
+`performance/k6/idempotency-hot-key.js` repeatedly resolves one seeded customer-scoped key under concurrent load. A separate Testcontainers test launches **eight simultaneous first writers** against real PostgreSQL + Redis and requires all callers to receive one payment ID with exactly one payment row and one outbox row.
+
+### Failure drills
+
+- `performance/resilience/redis-fail-open.sh` stops local Redis and verifies payment creation continues through PostgreSQL fallback.
+- `performance/resilience/kafka-outage-outbox-recovery.sh` stops local Kafka, verifies payment requests still commit, confirms outbox backlog accumulation, restarts Kafka, and waits for the relay to drain the backlog.
+
+Both scripts default to local-only safety boundaries. See [`performance/README.md`](performance/README.md) for commands and [`docs/slo.md`](docs/slo.md) for reference SLOs/alert interpretation.
+
+### Measurement discipline
+
+k6 thresholds are **targets**, not benchmark results. A real capacity run must record commit SHA, environment sizing, load shape, latency percentiles, error rate, outbox/Kafka/database signals, replica behavior, and the first saturated dependency. Use [`performance/results/TEMPLATE.md`](performance/results/TEMPLATE.md) for reproducible results.
+
+## API authorization
 
 | Service / operation | Authorization |
 | --- | --- |
 | Payment `POST /api/v1/payments` | `payments:write` |
 | Payment `GET /api/v1/payments/{paymentId}` | `payments:read` + JWT-sub ownership |
-| Transaction `GET /api/v1/operations/dlt/**` | `ops:read` |
-| Transaction `POST /api/v1/operations/dlt/{eventId}/replay` | `ops:write` |
-| Audit `GET /api/v1/audit/payments/{paymentId}` | `audit:read` |
-| Audit `GET /api/v1/audit/events/{eventId}` | `audit:read` |
-| Notification `GET /api/v1/notifications/{notificationId}` | `notification:read` |
-| Notification `GET /api/v1/notifications?paymentId=...` | `notification:read` |
-| `/actuator/metrics/**` | `ops:read` |
-| `/actuator/prometheus` | `ops:read` by default |
-| `/actuator/health`, `/actuator/info` | public health/probe endpoints |
-| `/v3/api-docs`, `/swagger-ui.html` | public API documentation where enabled |
+| Transaction DLT inspection | `ops:read` |
+| Transaction DLT replay | `ops:write` |
+| Audit timeline/evidence | `audit:read` |
+| Notification delivery queries | `notification:read` |
+| `/actuator/metrics/**`, `/actuator/prometheus` | `ops:read` by default |
+| `/actuator/health`, `/actuator/info` | public probe endpoints |
 
-Logical JWT audiences are independently configurable: `payment-api`, `transaction-ops-api`, `audit-api`, and `notification-api`.
+Logical JWT audiences are independently configurable for each service.
 
-## Observability
+## Observability and SLO signals
 
-All four services expose Micrometer telemetry and can export traces over OTLP. Domain metrics include payment outbox publication, transaction processing/DLT recovery, audit ingestion, and notification ingestion/delivery attempts.
+All services expose Micrometer telemetry and optional OpenTelemetry traces over OTLP. The local observability profile provisions Prometheus, Grafana, and Tempo.
 
-The local observability profile provisions Prometheus, Grafana, and Tempo. Shared environments should keep `/actuator/prometheus` protected and provide authenticated scraping instead of enabling the local unauthenticated switch.
+Phase 15 adds the `payments_outbox_oldest_age_seconds` freshness gauge and Prometheus rules for sustained Payment API 5xx rate, Payment p95 latency, stale outbox events, terminal outbox rows, Transaction DLT activity, Notification terminal failures, and Hikari connection-pool saturation.
 
-The AWS values profile points OTLP traffic at an in-cluster ADOT/OpenTelemetry Collector service, but Phase 14 does **not** provision that collector. Install one separately or override the endpoint before enabling real AWS trace export.
+The rules are operational early-warning signals; a short-window alert is not automatically a 30-day SLO violation. Shared environments should keep `/actuator/prometheus` authenticated rather than enabling the local unauthenticated scrape switch.
 
 ## Run locally
 
-Prerequisites: Java 17+, Maven, Docker, and an OAuth2/OIDC provider or test issuer exposing JWKS.
+Prerequisites: Java 17+, Maven, Docker, and an OAuth2/OIDC issuer exposing JWKS.
 
 ```bash
 docker compose up -d
@@ -202,13 +191,13 @@ mvn spring-boot:run -pl notification-service
 
 Service ports are `8080` through `8083`. Local PostgreSQL instances use `5432` through `5435`.
 
-Run the complete test suite:
+Run the complete deterministic suite with:
 
 ```bash
 mvn --batch-mode verify
 ```
 
-Start local monitoring with:
+Start monitoring with:
 
 ```bash
 docker compose --profile observability up -d
@@ -219,86 +208,58 @@ export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
 
 Grafana is on `localhost:3000`, Prometheus on `localhost:9090`, and Tempo on `localhost:3200`.
 
-## Kubernetes / Helm
+## Kubernetes and AWS delivery
 
-The chart is in `deploy/helm/payment-platform`. It deploys application workloads only. Database, Kafka, Redis, OIDC, and OTLP endpoints are injected through values.
+The Helm chart is in `deploy/helm/payment-platform`; the AWS Terraform reference is in `deploy/aws/terraform`.
 
-```bash
-helm lint deploy/helm/payment-platform
-helm template payment-platform deploy/helm/payment-platform --namespace payments
-```
+Normal CI performs Terraform formatting/provider-schema validation and Helm rendering **without AWS credentials and without creating billable resources**. `.github/workflows/aws-deploy.yml` is a manual `workflow_dispatch` path from `main` using a protected `production` GitHub Environment and short-lived OIDC credentials.
 
-The chart supports dedicated ServiceAccounts for all four workloads, hardened pod security, HPA/PDB, health probes, graceful rolling updates, and an optional Ingress. See [`docs/kubernetes.md`](docs/kubernetes.md).
-
-## AWS infrastructure and delivery
-
-Terraform is under `deploy/aws/terraform`. Normal CI performs formatting and provider-schema validation **without AWS credentials and without creating resources**.
-
-```bash
-terraform -chdir=deploy/aws/terraform fmt -check -diff -recursive
-terraform -chdir=deploy/aws/terraform init -backend=false -input=false
-terraform -chdir=deploy/aws/terraform validate
-```
-
-The AWS reference maps the platform to:
-
-```text
-Compute       Amazon EKS + managed node group
-Images        Amazon ECR, immutable tags
-Messaging     Amazon MSK Serverless + IAM/SASL
-Databases     four Amazon RDS for PostgreSQL instances
-Cache         ElastiCache Serverless for Redis
-Identity      EKS Pod Identity per workload
-CI/CD auth    GitHub Actions OIDC -> short-lived AWS role
-Logs          EKS control-plane logs -> CloudWatch
-```
-
-The deployment workflow `.github/workflows/aws-deploy.yml` is **manual (`workflow_dispatch`) only** and restricted to the `production` GitHub Environment. It builds/pushes commit-tagged ECR images, discovers managed endpoints, materializes RDS-managed credentials from Secrets Manager into the existing Kubernetes Secret contract, and deploys with Helm `--atomic` before checking all four rollouts.
-
-A real AWS apply/deploy requires an AWS account and creates billable resources. This repository does not automatically run `terraform apply` or deploy to AWS on merge. See [`docs/aws.md`](docs/aws.md) for the architecture, prerequisites, identity boundaries, state backend guidance, deployment variables, and operational notes.
+The AWS workflow builds commit-tagged ECR images, discovers RDS/MSK/Redis endpoints, materializes RDS-managed credentials from Secrets Manager into the existing Kubernetes Secret contract, performs `helm upgrade --install --atomic`, and checks all four rollouts. A real AWS apply/deploy requires an AWS account and explicit operator action. See [`docs/aws.md`](docs/aws.md) and [`docs/kubernetes.md`](docs/kubernetes.md).
 
 ## Verification
 
-**Payment Service:** PostgreSQL + Redis tests cover concurrent/customer-scoped idempotency, rollback/cache behavior, outbox claiming, JWT authorization/ownership, OpenAPI, and Prometheus metrics.
+**Payment:** real PostgreSQL + Redis tests cover customer-scoped idempotency, concurrent insert races, eight-way contention, rollback/cache behavior, outbox claiming, JWT authorization/ownership, OpenAPI, and metrics.
 
-**Transaction Service:** Kafka + PostgreSQL tests cover duplicate delivery, DLT indexing, secured replay, repeat-replay safety, and operational scopes.
+**Transaction:** real Kafka + PostgreSQL tests cover duplicate delivery, DLT indexing, secured replay, repeat-replay safety, and operator scopes.
 
-**Audit Service:** Kafka + PostgreSQL tests verify logical duplicate events produce one record, stored hashes verify successfully, PostgreSQL rejects audit mutation, malformed records reach the audit DLT, audit APIs enforce `audit:read`, and OpenAPI remains public.
+**Audit:** real Kafka + PostgreSQL tests cover duplicate events, digest verification, database-enforced immutability, malformed-event DLT routing, secured APIs, and OpenAPI.
 
-**Notification Service:** Kafka + PostgreSQL tests verify logical duplicate events create one delivery, retryable failure persists `RETRY_PENDING` and later reaches `SENT`, permanent failure reaches `FAILED`, malformed records reach the notification DLT, APIs enforce `notification:read`, and OpenAPI remains public.
+**Notification:** real Kafka + PostgreSQL tests cover deduplicated delivery creation, retry scheduling, successful recovery, permanent failure, malformed-event DLT routing, secured APIs, and OpenAPI.
 
-**Infrastructure:** CI validates the observability profile, Terraform formatting/provider schemas, generic Helm output, the AWS MSK-IAM/Redis-TLS Helm profile, four dedicated ServiceAccounts, the complete Maven reactor, and all four hardened service images.
+**Performance/observability:** CI runs Prometheus `promtool` validation, k6 script inspection, and shell syntax validation for local failure drills. It intentionally does not benchmark on shared GitHub runners.
+
+**Infrastructure:** CI validates Terraform formatting/provider schemas, generic + AWS Helm output, four dedicated workload identities, the complete Maven reactor, and all four hardened images.
 
 ## Roadmap
 
-- [x] Payment command API + PostgreSQL/Flyway
-- [x] Redis idempotency fast path + concurrency-safe customer-scoped idempotency
+- [x] Payment API + PostgreSQL/Flyway
+- [x] Redis fast-path + concurrency-safe customer-scoped idempotency
 - [x] Transactional outbox + multi-instance `SKIP LOCKED` relay
 - [x] Idempotent Transaction Service + Kafka retries/DLT recovery
-- [x] Durable DLT indexing + secured operational replay
-- [x] OAuth2/JWT authentication and authorization
-- [x] OpenAPI + Swagger UI
+- [x] Durable DLT indexing + secured replay
+- [x] OAuth2/JWT + OpenAPI/Swagger
 - [x] Prometheus + OpenTelemetry + Grafana/Tempo
-- [x] Immutable Audit Service + dedicated datastore
-- [x] Notification Service + leased retryable provider dispatch
-- [x] PostgreSQL / Redis / Kafka Testcontainers verification
-- [x] Containerized service runtime + Kubernetes/Helm deployment
-- [x] **AWS Terraform reference architecture + OIDC/ECR/EKS delivery pipeline**
+- [x] Immutable Audit Service
+- [x] Notification Service + leased provider dispatch
+- [x] PostgreSQL / Redis / Kafka Testcontainers
+- [x] Kubernetes/Helm + hardened containers
+- [x] AWS Terraform + OIDC/ECR/EKS delivery path
+- [x] **Performance/resilience harness + SLO/alert framework**
+- [ ] Measured capacity report from an isolated Kubernetes/AWS test environment
 - [ ] Expand audit ingestion to transaction/notification lifecycle topics
-- [ ] Real provider adapter with secret-managed credentials
-- [ ] AWS observability hardening: ADOT/managed Prometheus/alerts
-- [ ] Load/performance testing and capacity report
+- [ ] Real notification provider adapter with secret-managed credentials
+- [ ] AWS observability hardening with ADOT/managed telemetry
+- [ ] Supply-chain/security scanning and SBOM generation
 
 ## Tech stack
 
 **Backend:** Java 17, Spring Boot, Spring Data JPA, Spring Data Redis, Spring Kafka  
-**API:** REST, OpenAPI, springdoc, Swagger UI  
-**Security:** Spring Security, OAuth2 Resource Server, JWT, JWKS, scopes, AWS IAM, EKS Pod Identity, GitHub OIDC  
+**API/Security:** REST, OpenAPI, Swagger UI, Spring Security, OAuth2 Resource Server, JWT, JWKS  
 **Data:** PostgreSQL, Redis, Amazon RDS, ElastiCache Serverless  
 **Messaging:** Apache Kafka, Amazon MSK Serverless, AWS MSK IAM auth  
-**Observability:** Micrometer, Prometheus, OpenTelemetry, OTLP, Tempo, Grafana, Spring Boot Actuator, CloudWatch control-plane logs  
-**Testing:** JUnit, Spring Security Test, Testcontainers  
-**Infrastructure:** Docker, Docker Compose, Kubernetes, Helm, Terraform, Amazon EKS, ECR, RDS, MSK, ElastiCache, IAM, Secrets Manager, GitHub Actions
+**Observability:** Micrometer, Prometheus, OpenTelemetry, OTLP, Tempo, Grafana, CloudWatch  
+**Testing:** JUnit, Spring Security Test, Testcontainers, k6, Prometheus promtool  
+**Infrastructure:** Docker, Docker Compose, Kubernetes, Helm, Terraform, EKS, ECR, RDS, MSK, ElastiCache, IAM, Secrets Manager, GitHub Actions
 
 ## Repository structure
 
@@ -308,29 +269,24 @@ event-driven-payment-platform/
 ├── transaction-service/
 ├── audit-service/
 ├── notification-service/
+├── performance/
+│   ├── k6/
+│   ├── resilience/
+│   └── results/
 ├── deploy/
 │   ├── helm/payment-platform/
-│   │   ├── Chart.yaml
-│   │   ├── values.yaml
-│   │   ├── values-aws.yaml
-│   │   └── templates/
 │   └── aws/terraform/
-│       ├── networking.tf
-│       ├── platform.tf
-│       ├── iam.tf
-│       ├── variables.tf
-│       ├── outputs.tf
-│       └── versions.tf
 ├── observability/
+│   ├── prometheus/alerts/
+│   ├── grafana/
+│   └── tempo/
 ├── docs/
 │   ├── architecture.md
 │   ├── kubernetes.md
-│   └── aws.md
+│   ├── aws.md
+│   └── slo.md
 ├── Dockerfile
-├── .dockerignore
 ├── .github/workflows/
-│   ├── ci.yml
-│   └── aws-deploy.yml
 ├── docker-compose.yml
 ├── pom.xml
 └── README.md
@@ -338,4 +294,4 @@ event-driven-payment-platform/
 
 ## Design principle
 
-Each milestone introduces a concrete production concern and documents the trade-off it solves. The repository evolves through reviewable PRs so its history demonstrates service boundaries, failure modes, correctness invariants, deployment boundaries, cloud identity, and executable verification rather than a one-shot code dump.
+Each milestone introduces a concrete production concern and an executable way to reason about it. The repository deliberately distinguishes **correctness guarantees, engineering targets, validated infrastructure, and measured runtime results** so its history shows real trade-offs rather than a one-shot demo or unsupported production claims.
