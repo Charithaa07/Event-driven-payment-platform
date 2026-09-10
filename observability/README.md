@@ -1,10 +1,10 @@
 # Local Observability Stack
 
-Phase 9 adds a local monitoring stack for the Event-Driven Payment Platform:
+The local monitoring stack for the Event-Driven Payment Platform includes:
 
-- **Prometheus** scrapes Micrometer metrics from both Spring Boot services.
-- **Grafana** is provisioned with Prometheus and Tempo data sources plus a payment-platform dashboard.
-- **Tempo** receives OTLP traces from the Payment Service and Transaction Service.
+- **Prometheus** scraping Micrometer metrics from both Spring Boot services.
+- **Grafana** provisioned with Prometheus and Tempo data sources plus a payment-platform dashboard.
+- **Tempo** receiving OTLP traces from Payment Service and Transaction Service.
 
 ## Start infrastructure
 
@@ -23,7 +23,7 @@ Grafana is configured for anonymous admin access **only for this local developer
 
 ## Start the application services with local telemetry
 
-Payment Service protects `/actuator/prometheus` with `ops:read` by default. The local Prometheus container does not have an OAuth2 token, so local development explicitly enables the public scrape endpoint:
+Both application services protect `/actuator/prometheus` with `ops:read` by default. The local Prometheus container does not have an OAuth2 token, so local development explicitly enables the public scrape endpoint:
 
 ```bash
 export OBSERVABILITY_PUBLIC_PROMETHEUS=true
@@ -39,11 +39,11 @@ mvn spring-boot:run -pl payment-service
 mvn spring-boot:run -pl transaction-service
 ```
 
-`OBSERVABILITY_PUBLIC_PROMETHEUS=true` is a local convenience switch. Leave it `false` in real deployments and give the Prometheus scraper an authenticated path instead.
+`OBSERVABILITY_PUBLIC_PROMETHEUS=true` is a local convenience switch. Leave it `false` in real deployments and give the Prometheus scraper an authenticated or otherwise protected path instead.
 
-## Metrics represented in the dashboard
+## Metrics represented in the platform
 
-The provisioned dashboard combines framework and domain-specific telemetry, including:
+The services expose framework and domain-specific telemetry, including:
 
 - Payment API request rate and p95 latency
 - JVM heap usage
@@ -52,6 +52,11 @@ The provisioned dashboard combines framework and domain-specific telemetry, incl
 - Transaction Service event outcomes (`received`, `created`, `duplicate`, `malformed`)
 - transaction processing latency
 - dead-letter publications
+- durably indexed DLT records
+- DLT recovery backlog (`PENDING + FAILED`)
+- DLT replay outcomes (`success` / `failure`)
+
+The Phase 9 dashboard covers the core API/outbox/consumer signals. Phase 10 recovery metrics are also available to Prometheus for operational queries and future dashboard panels.
 
 ## Trace boundary
 
