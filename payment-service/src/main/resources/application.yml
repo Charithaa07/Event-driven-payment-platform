@@ -24,6 +24,12 @@ spring:
       properties:
         enable.idempotence: true
 
+security:
+  jwt:
+    issuer: ${JWT_ISSUER_URI:https://auth.example.com/}
+    audience: ${JWT_AUDIENCE:payment-api}
+    jwk-set-uri: ${JWT_JWK_SET_URI:http://localhost:9000/oauth2/jwks}
+
 idempotency:
   redis:
     ttl-hours: ${IDEMPOTENCY_REDIS_TTL_HOURS:24}
@@ -44,7 +50,7 @@ management:
         include: health,info,metrics,prometheus
   endpoint:
     health:
-      show-details: always
+      show-details: when-authorized
 
 server:
   port: ${PORT:8080}
