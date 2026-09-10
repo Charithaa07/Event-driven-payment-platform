@@ -1,6 +1,7 @@
 package com.charitha.notifications.integration;
 
 import com.charitha.notifications.delivery.DeliveryReceipt;
+import com.charitha.notifications.delivery.NotificationMessage;
 import com.charitha.notifications.delivery.NotificationProvider;
 import com.charitha.notifications.delivery.NotificationProviderException;
 import com.charitha.notifications.domain.NotificationDelivery;
@@ -18,8 +19,8 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Primary;
 import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
@@ -58,8 +59,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @Import(NotificationServiceIntegrationTest.ProviderTestConfig.class)
 @SpringBootTest(properties = {
         "notifications.dispatch.fixed-delay-ms=50",
-        "notifications.dispatch.base-backoff-ms=100",
-        "notifications.dispatch.max-backoff-ms=200",
+        "notifications.dispatch.base-backoff-ms=750",
+        "notifications.dispatch.max-backoff-ms=750",
         "notifications.dispatch.lease-timeout-ms=1000"
 })
 class NotificationServiceIntegrationTest {
@@ -118,6 +119,8 @@ class NotificationServiceIntegrationTest {
 
         awaitTrue(() -> repository.count() == 1L, Duration.ofSeconds(15));
         awaitTrue(() -> repository.findByPaymentIdOrderByCreatedAtAsc(paymentId).stream()
+                .anyMatch(delivery -> delivery.getStatus() == NotificationStatus.RETRY_PENDING), Duration.ofSeconds(15));
+        awaitTrue(() -> repository.findByPaymentIdOrderByCreatedAtAsc(paymentId).stream()
                 .anyMatch(delivery -> delivery.getStatus() == NotificationStatus.SENT), Duration.ofSeconds(15));
 
         NotificationDelivery delivery = repository.findByPaymentIdOrderByCreatedAtAsc(paymentId).get(0);
@@ -142,6 +145,7 @@ class NotificationServiceIntegrationTest {
 
         NotificationDelivery delivery = repository.findByPaymentIdOrderByCreatedAtAsc(paymentId).get(0);
         assertEquals(1, delivery.getAttemptCount());
+        assertEquals("test-provider", delivery.getProvider());
         assertTrue(delivery.getLastError().contains("permanent provider rejection"));
     }
 
@@ -262,21 +266,29 @@ class NotificationServiceIntegrationTest {
         @Primary
         NotificationProvider flakyProvider() {
             ConcurrentHashMap<UUID, AtomicInteger> attempts = new ConcurrentHashMap<>();
-            return message -> {
-                if (message.customerReference().contains("permanent-failure")) {
-                    throw new NotificationProviderException("permanent provider rejection", false);
+            return new NotificationProvider() {
+                @Override
+                public String providerName() {
+                    return "test-provider";
                 }
 
-                int attempt = attempts
-                        .computeIfAbsent(message.idempotencyKey(), ignored -> new AtomicInteger())
-                        .incrementAndGet();
-                if (attempt == 1) {
-                    throw new NotificationProviderException("temporary provider outage", true);
+                @Override
+                public DeliveryReceipt send(NotificationMessage message) {
+                    if (message.customerReference().contains("permanent-failure")) {
+                        throw new NotificationProviderException("permanent provider rejection", false);
+                    }
+
+                    int attempt = attempts
+                            .computeIfAbsent(message.idempotencyKey(), ignored -> new AtomicInteger())
+                            .incrementAndGet();
+                    if (attempt == 1) {
+                        throw new NotificationProviderException("temporary provider outage", true);
+                    }
+                    return new DeliveryReceipt(
+                            providerName(),
+                            "test-" + message.idempotencyKey()
+                    );
                 }
-                return new DeliveryReceipt(
-                        "test-provider",
-                        "test-" + message.idempotencyKey()
-                );
             };
         }
     }

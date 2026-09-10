@@ -9,6 +9,11 @@ public class LoggingNotificationProvider implements NotificationProvider {
     private static final Logger log = LoggerFactory.getLogger(LoggingNotificationProvider.class);
 
     @Override
+    public String providerName() {
+        return "logging";
+    }
+
+    @Override
     public DeliveryReceipt send(NotificationMessage message) {
         String providerMessageId = "log-" + message.idempotencyKey();
         log.info(
@@ -18,6 +23,6 @@ public class LoggingNotificationProvider implements NotificationProvider {
                 message.template(),
                 message.attemptNumber()
         );
-        return new DeliveryReceipt("logging", providerMessageId);
+        return new DeliveryReceipt(providerName(), providerMessageId);
     }
 }

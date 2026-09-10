@@ -12,6 +12,8 @@ import java.util.UUID;
 
 @Service
 public class NotificationCompletionService {
+    private static final int PROVIDER_MAX_LENGTH = 80;
+
     private final NotificationDeliveryRepository repository;
     private final int maxAttempts;
     private final long baseBackoffMs;
@@ -32,7 +34,7 @@ public class NotificationCompletionService {
     public void markSent(UUID notificationId, String provider, String providerMessageId, Instant now) {
         NotificationDelivery delivery = repository.findById(notificationId).orElseThrow();
         if (delivery.getStatus() == NotificationStatus.PROCESSING) {
-            delivery.markSent(provider, providerMessageId, now);
+            delivery.markSent(safeProvider(provider), providerMessageId, now);
         }
     }
 
@@ -50,14 +52,15 @@ public class NotificationCompletionService {
                     : NotificationFailureDisposition.FAILED;
         }
 
-        String safeError = truncate(error);
+        String safeProvider = safeProvider(provider);
+        String safeError = truncate(error, 500);
         if (retryable && delivery.getAttemptCount() < maxAttempts) {
             long delayMs = backoffForAttempt(delivery.getAttemptCount());
-            delivery.markRetry(provider, safeError, now.plusMillis(delayMs), now);
+            delivery.markRetry(safeProvider, safeError, now.plusMillis(delayMs), now);
             return NotificationFailureDisposition.RETRY_SCHEDULED;
         }
 
-        delivery.markFailed(provider, safeError, now);
+        delivery.markFailed(safeProvider, safeError, now);
         return NotificationFailureDisposition.FAILED;
     }
 
@@ -73,8 +76,12 @@ public class NotificationCompletionService {
         return Math.min(candidate, maxBackoffMs);
     }
 
-    private String truncate(String error) {
-        String value = error == null || error.isBlank() ? "Provider delivery failed" : error;
-        return value.length() <= 500 ? value : value.substring(0, 500);
+    private String safeProvider(String provider) {
+        String value = provider == null || provider.isBlank() ? "unknown" : provider;
+        return truncate(value, PROVIDER_MAX_LENGTH);
+    }
+
+    private String truncate(String value, int maxLength) {
+        return value.length() <= maxLength ? value : value.substring(0, maxLength);
     }
 }
