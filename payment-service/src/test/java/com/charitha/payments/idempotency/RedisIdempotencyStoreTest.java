@@ -37,8 +37,8 @@ class RedisIdempotencyStoreTest {
                 Instant.parse("2026-09-10T17:00:00Z")
         );
 
-        assertTrue(store.findPayment("req-123").isEmpty());
-        assertDoesNotThrow(() -> store.put("req-123", payment));
-        assertDoesNotThrow(() -> store.evict("req-123"));
+        assertTrue(store.findPayment("customer-1", "req-123").isEmpty());
+        assertDoesNotThrow(() -> store.put("customer-1", "req-123", payment));
+        assertDoesNotThrow(() -> store.evict("customer-1", "req-123"));
     }
 }

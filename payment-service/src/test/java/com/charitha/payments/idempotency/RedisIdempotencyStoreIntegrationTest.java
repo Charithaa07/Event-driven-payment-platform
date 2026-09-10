@@ -18,7 +18,11 @@ import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @Testcontainers
 class RedisIdempotencyStoreIntegrationTest {
@@ -49,20 +53,21 @@ class RedisIdempotencyStoreIntegrationTest {
     @Test
     void storesCompletePaymentResponseWithTtlAndReadsItBack() {
         RedisIdempotencyStore store = new RedisIdempotencyStore(redisTemplate, jsonMapper, 1);
+        String customerId = "customer-1";
         String idempotencyKey = "checkout-redis-1";
         Payment payment = new Payment(
                 UUID.randomUUID(),
                 idempotencyKey,
                 new BigDecimal("42.50"),
                 "USD",
-                "customer-1",
+                customerId,
                 PaymentStatus.ACCEPTED,
                 Instant.parse("2026-09-10T17:00:00Z")
         );
 
-        store.put(idempotencyKey, payment);
+        store.put(customerId, idempotencyKey, payment);
 
-        Payment cached = store.findPayment(idempotencyKey).orElseThrow();
+        Payment cached = store.findPayment(customerId, idempotencyKey).orElseThrow();
         assertEquals(payment.getId(), cached.getId());
         assertEquals(payment.getIdempotencyKey(), cached.getIdempotencyKey());
         assertEquals(payment.getAmount(), cached.getAmount());
@@ -72,7 +77,7 @@ class RedisIdempotencyStoreIntegrationTest {
         assertEquals(payment.getCreatedAt(), cached.getCreatedAt());
 
         Long ttlSeconds = redisTemplate.getExpire(
-                RedisIdempotencyStore.redisKey(idempotencyKey),
+                RedisIdempotencyStore.redisKey(customerId, idempotencyKey),
                 TimeUnit.SECONDS
         );
         assertNotNull(ttlSeconds);
@@ -82,11 +87,21 @@ class RedisIdempotencyStoreIntegrationTest {
     @Test
     void malformedCachedValueIsEvictedAndTreatedAsMiss() {
         RedisIdempotencyStore store = new RedisIdempotencyStore(redisTemplate, jsonMapper, 1);
+        String customerId = "customer-1";
         String idempotencyKey = "checkout-malformed";
-        String redisKey = RedisIdempotencyStore.redisKey(idempotencyKey);
+        String redisKey = RedisIdempotencyStore.redisKey(customerId, idempotencyKey);
         redisTemplate.opsForValue().set(redisKey, "not-json");
 
-        assertTrue(store.findPayment(idempotencyKey).isEmpty());
+        assertTrue(store.findPayment(customerId, idempotencyKey).isEmpty());
         assertFalse(Boolean.TRUE.equals(redisTemplate.hasKey(redisKey)));
+    }
+
+    @Test
+    void sameIdempotencyKeyUsesDifferentCacheKeysForDifferentCustomers() {
+        String sharedKey = "checkout-shared";
+        assertNotEquals(
+                RedisIdempotencyStore.redisKey("customer-a", sharedKey),
+                RedisIdempotencyStore.redisKey("customer-b", sharedKey)
+        );
     }
 }
