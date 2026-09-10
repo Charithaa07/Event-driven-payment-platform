@@ -50,7 +50,7 @@ class PaymentEventFlowIntegrationTest {
             .withPassword("transactions");
 
     @Container
-    static KafkaContainer kafka = new KafkaContainer("apache/kafka-native:4.0.0");
+    static KafkaContainer kafka = new KafkaContainer("apache/kafka:4.0.0");
 
     @DynamicPropertySource
     static void kafkaProperties(DynamicPropertyRegistry registry) {
@@ -93,7 +93,6 @@ class PaymentEventFlowIntegrationTest {
         kafkaTemplate.send(PAYMENT_CREATED_TOPIC, paymentId.toString(), payload).get(10, TimeUnit.SECONDS);
 
         awaitTrue(() -> processedEventRepository.existsById(eventId), Duration.ofSeconds(15));
-        // Give the second delivery time to pass through the idempotency check.
         Thread.sleep(1_000L);
 
         Optional<TransactionRecord> persisted = transactionRepository.findByPaymentId(paymentId);

@@ -42,19 +42,20 @@ public class PaymentService {
     public Payment create(String idempotencyKey, CreatePaymentRequest request) {
         Optional<Payment> cachedPayment = idempotencyStore.findPayment(idempotencyKey);
         if (cachedPayment.isPresent()) {
-            return cachedPayment.get();
+            Payment payment = cachedPayment.get();
+            assertSameRequest(payment, request, idempotencyKey);
+            return payment;
         }
 
         Optional<Payment> persistedPayment = repository.findByIdempotencyKey(idempotencyKey);
         if (persistedPayment.isPresent()) {
             Payment payment = persistedPayment.get();
+            assertSameRequest(payment, request, idempotencyKey);
             idempotencyStore.put(idempotencyKey, payment);
             return payment;
         }
 
-        Payment created = createNew(idempotencyKey, request);
-        cacheAfterCommit(idempotencyKey, created);
-        return created;
+        return createOrResolveConcurrentRequest(idempotencyKey, request);
     }
 
     @Transactional(readOnly = true)
@@ -63,9 +64,9 @@ public class PaymentService {
                 .orElseThrow(() -> new PaymentNotFoundException(paymentId));
     }
 
-    private Payment createNew(String idempotencyKey, CreatePaymentRequest request) {
+    private Payment createOrResolveConcurrentRequest(String idempotencyKey, CreatePaymentRequest request) {
         Instant now = Instant.now();
-        Payment payment = new Payment(
+        Payment candidate = new Payment(
                 UUID.randomUUID(),
                 idempotencyKey,
                 request.amount(),
@@ -75,27 +76,59 @@ public class PaymentService {
                 now
         );
 
-        Payment saved = repository.save(payment);
+        int inserted = repository.insertIfAbsent(
+                candidate.getId(),
+                candidate.getIdempotencyKey(),
+                candidate.getAmount(),
+                candidate.getCurrency(),
+                candidate.getCustomerId(),
+                candidate.getStatus().name(),
+                candidate.getCreatedAt()
+        );
+
+        if (inserted == 0) {
+            Payment existing = repository.findByIdempotencyKey(idempotencyKey)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "Idempotency conflict was detected but the winning payment could not be loaded"
+                    ));
+            assertSameRequest(existing, request, idempotencyKey);
+            idempotencyStore.put(idempotencyKey, existing);
+            return existing;
+        }
+
         PaymentCreatedEvent event = new PaymentCreatedEvent(
                 UUID.randomUUID(),
-                saved.getId(),
-                saved.getAmount(),
-                saved.getCurrency(),
-                saved.getCustomerId(),
+                candidate.getId(),
+                candidate.getAmount(),
+                candidate.getCurrency(),
+                candidate.getCustomerId(),
                 now
         );
 
         outboxRepository.save(new OutboxEvent(
                 event.eventId(),
                 "PAYMENT",
-                saved.getId(),
+                candidate.getId(),
                 "PAYMENT_CREATED_V1",
                 PAYMENT_CREATED_TOPIC,
                 serialize(event),
                 now
         ));
 
-        return saved;
+        cacheAfterCommit(idempotencyKey, candidate);
+        return candidate;
+    }
+
+    private void assertSameRequest(Payment payment,
+                                   CreatePaymentRequest request,
+                                   String idempotencyKey) {
+        boolean sameAmount = payment.getAmount().compareTo(request.amount()) == 0;
+        boolean sameCurrency = payment.getCurrency().equals(request.currency());
+        boolean sameCustomer = payment.getCustomerId().equals(request.customerId());
+
+        if (!sameAmount || !sameCurrency || !sameCustomer) {
+            throw new IdempotencyConflictException(idempotencyKey);
+        }
     }
 
     private void cacheAfterCommit(String idempotencyKey, Payment payment) {

@@ -17,10 +17,25 @@ spring:
       port: ${REDIS_PORT:6379}
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
 
 idempotency:
   redis:
     ttl-hours: ${IDEMPOTENCY_REDIS_TTL_HOURS:24}
+
+outbox:
+  relay:
+    enabled: ${OUTBOX_RELAY_ENABLED:true}
+    fixed-delay-ms: ${OUTBOX_RELAY_FIXED_DELAY_MS:1000}
+    publish-timeout-ms: ${OUTBOX_RELAY_PUBLISH_TIMEOUT_MS:10000}
+    max-attempts: ${OUTBOX_RELAY_MAX_ATTEMPTS:10}
+    retry-base-ms: ${OUTBOX_RELAY_RETRY_BASE_MS:1000}
+    retry-max-ms: ${OUTBOX_RELAY_RETRY_MAX_MS:60000}
 
 management:
   endpoints:

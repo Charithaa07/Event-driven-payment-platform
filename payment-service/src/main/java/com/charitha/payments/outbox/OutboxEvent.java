@@ -4,6 +4,7 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+
 import java.time.Instant;
 import java.util.UUID;
 
@@ -40,6 +41,15 @@ public class OutboxEvent {
     @Column(name = "published_at")
     private Instant publishedAt;
 
+    @Column(name = "next_attempt_at", nullable = false)
+    private Instant nextAttemptAt;
+
+    @Column(name = "claimed_at")
+    private Instant claimedAt;
+
+    @Column(name = "last_error", length = 1000)
+    private String lastError;
+
     protected OutboxEvent() {
     }
 
@@ -54,6 +64,7 @@ public class OutboxEvent {
         this.status = "PENDING";
         this.attempts = 0;
         this.createdAt = createdAt;
+        this.nextAttemptAt = createdAt;
     }
 
     public UUID getId() { return id; }
@@ -65,14 +76,27 @@ public class OutboxEvent {
     public int getAttempts() { return attempts; }
     public Instant getCreatedAt() { return createdAt; }
     public Instant getPublishedAt() { return publishedAt; }
+    public Instant getNextAttemptAt() { return nextAttemptAt; }
+    public Instant getClaimedAt() { return claimedAt; }
+    public String getLastError() { return lastError; }
+
+    public void claim(Instant claimedAt) {
+        this.status = "PROCESSING";
+        this.claimedAt = claimedAt;
+        this.attempts++;
+    }
 
     public void markPublished(Instant publishedAt) {
         this.status = "PUBLISHED";
         this.publishedAt = publishedAt;
-        this.attempts++;
+        this.claimedAt = null;
+        this.lastError = null;
     }
 
-    public void registerFailure() {
-        this.attempts++;
+    public void recordFailure(Instant nextAttemptAt, String lastError, boolean terminal) {
+        this.status = terminal ? "FAILED" : "PENDING";
+        this.nextAttemptAt = nextAttemptAt;
+        this.claimedAt = null;
+        this.lastError = lastError;
     }
 }
