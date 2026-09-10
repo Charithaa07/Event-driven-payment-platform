@@ -126,7 +126,7 @@ resource "aws_eks_node_group" "main" {
 }
 
 resource "aws_eks_addon" "core" {
-  for_each = toset(["vpc-cni", "coredns", "kube-proxy", "eks-pod-identity-agent"])
+  for_each = toset(["vpc-cni", "coredns", "kube-proxy", "eks-pod-identity-agent", "metrics-server"])
 
   cluster_name = aws_eks_cluster.main.name
   addon_name   = each.value
