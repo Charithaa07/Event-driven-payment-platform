@@ -14,6 +14,9 @@ public class TransactionConsumerMetrics {
     private final Counter duplicate;
     private final Counter malformed;
     private final Counter dltPublished;
+    private final Counter dltIndexed;
+    private final Counter dltReplaySuccess;
+    private final Counter dltReplayFailure;
     private final Timer createdLatency;
     private final Timer duplicateLatency;
 
@@ -25,6 +28,11 @@ public class TransactionConsumerMetrics {
         this.dltPublished = Counter.builder("transactions.kafka.dlt")
                 .description("Payment events published to the dead-letter topic")
                 .register(registry);
+        this.dltIndexed = Counter.builder("transactions.kafka.dlt.indexed")
+                .description("Dead-letter records durably indexed for operational recovery")
+                .register(registry);
+        this.dltReplaySuccess = replayCounter(registry, "success");
+        this.dltReplayFailure = replayCounter(registry, "failure");
         this.createdLatency = processingTimer(registry, "created");
         this.duplicateLatency = processingTimer(registry, "duplicate");
     }
@@ -51,9 +59,28 @@ public class TransactionConsumerMetrics {
         dltPublished.increment();
     }
 
+    public void recordDltIndexed() {
+        dltIndexed.increment();
+    }
+
+    public void recordDltReplay(boolean successful) {
+        if (successful) {
+            dltReplaySuccess.increment();
+        } else {
+            dltReplayFailure.increment();
+        }
+    }
+
     private Counter eventCounter(MeterRegistry registry, String outcome) {
         return Counter.builder("transactions.payment.events")
                 .description("Payment-created events observed by Transaction Service")
+                .tag("outcome", outcome)
+                .register(registry);
+    }
+
+    private Counter replayCounter(MeterRegistry registry, String outcome) {
+        return Counter.builder("transactions.kafka.dlt.replay")
+                .description("Dead-letter replay attempts by outcome")
                 .tag("outcome", outcome)
                 .register(registry);
     }

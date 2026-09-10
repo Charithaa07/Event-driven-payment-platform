@@ -1,6 +1,6 @@
 # Architecture Notes
 
-## Phase 9 system flow
+## Phase 10 system flow
 
 1. A client obtains an access token from an external OAuth2/OIDC provider.
 2. Payment Service validates JWT signature, issuer, audience, timing, subject, and OAuth scopes.
@@ -10,11 +10,14 @@
 6. The outbox relay claims work with `FOR UPDATE SKIP LOCKED`, releases the DB transaction, then publishes to Kafka.
 7. Transaction Service consumes the event and commits the business transaction plus `processed_events` marker atomically.
 8. Retryable Kafka failures receive two retries; exhausted or malformed events go to `payments.created.v1.DLT`.
-9. springdoc generates the Payment Service OpenAPI contract and Swagger UI from runtime API metadata.
-10. Micrometer exposes framework and domain metrics through Prometheus endpoints.
-11. OpenTelemetry exports sampled traces over OTLP when tracing export is enabled.
-12. Kafka producer/listener observation is enabled so normal Kafka records can carry tracing context.
-13. Prometheus, Tempo, and Grafana form the local observability plane.
+9. A dedicated DLT indexer persists each dead-letter Kafka position, failure diagnostics, payload, and recovery state in Transaction Service PostgreSQL.
+10. Transaction Service also acts as an OAuth2 resource server for the operational recovery API: `ops:read` inspects DLT state and `ops:write` authorizes replay.
+11. Replay uses an atomic `REPLAYING` claim with a stale-claim lease, publishes outside the DB transaction, and records the authenticated operator plus outcome.
+12. springdoc generates the Payment Service OpenAPI contract and Swagger UI from runtime API metadata.
+13. Micrometer exposes framework, domain, and DLT recovery metrics through Prometheus endpoints.
+14. OpenTelemetry exports sampled traces over OTLP when tracing export is enabled.
+15. Kafka producer/listener observation is enabled so normal Kafka records can carry tracing context.
+16. Prometheus, Tempo, and Grafana form the local observability plane.
 
 ## Runtime architecture
 
@@ -22,26 +25,27 @@
 OAuth2/OIDC Provider
         |
         | JWKS
-        v
-Client -> Payment Service -> Redis
-              |
-              +-> Payment PostgreSQL
-                       |
-                       `-> Outbox
-                            |
-                    SKIP LOCKED claim
-                            |
-                            v
-                      Outbox Relay
-                            |
-                            v
-                          Kafka
-                            |
-                            v
-                    Transaction Service
-                       |            |
-                       v            v
-              Transaction DB      DLT
+        +-------------------+
+        v                   v
+Client -> Payment Service   Transaction Service <--- Operator
+              |                  |     ^              ops:read/write
+              +-> Redis          |     |
+              +-> Payment DB     |     +--- DLT recovery API
+                     |           |
+                     `-> Outbox  +-> Transaction DB
+                          |       |      +-- processed_events
+                   SKIP LOCKED    |      `-- dead_letter_events
+                          |       |
+                          v       |
+                     Outbox Relay |
+                          |       |
+                          v       |
+                        Kafka ----+
+                          |
+                          +--> payments.created.v1.DLT
+                                      |
+                                      v
+                                  DLT Indexer
 
 Payment Service ------ Prometheus scrape ------+
 Transaction Service -- Prometheus scrape ------+--> Grafana
@@ -51,25 +55,25 @@ Transaction Service -- OTLP traces ------------+
 
 ## Security boundary
 
-Payment Service is a stateless OAuth2 Resource Server. It does not issue credentials.
+Both HTTP-facing services are stateless OAuth2 resource servers. Neither issues credentials.
+
+Payment Service scopes:
 
 ```text
-JWT
- |
- +-- signature via JWKS
- +-- issuer
- +-- audience
- +-- expiration/timing
- +-- non-empty subject
- |
- v
-scope authorization
- +-- payments:write -> POST /api/v1/payments
- +-- payments:read  -> GET /api/v1/payments/{id}
- `-- ops:read       -> metrics / Prometheus by default
+payments:write -> POST /api/v1/payments
+payments:read  -> GET /api/v1/payments/{id}
+ops:read       -> metrics / Prometheus by default
 ```
 
-`/actuator/health`, `/actuator/info`, OpenAPI JSON/YAML, and Swagger UI remain public. `/actuator/prometheus` is protected by `ops:read` unless the explicit local-development setting `OBSERVABILITY_PUBLIC_PROMETHEUS=true` is enabled. That switch is intended only for the local unauthenticated Prometheus container.
+Transaction Service operational scopes:
+
+```text
+ops:read  -> GET  /api/v1/operations/dlt[/{id}]
+ops:write -> POST /api/v1/operations/dlt/{id}/replay
+ops:read  -> metrics / Prometheus by default
+```
+
+`/actuator/health` and `/actuator/info` remain public. `/actuator/prometheus` is protected by `ops:read` unless the explicit local-development setting `OBSERVABILITY_PUBLIC_PROMETHEUS=true` is enabled. That switch exists only for the local unauthenticated Prometheus container.
 
 ## Customer-scoped idempotency
 
@@ -116,7 +120,7 @@ Kafka I/O outside DB lock
 
 The relay is intentionally **at least once**. A crash after Kafka acknowledges a send but before PostgreSQL records `PUBLISHED` can produce redelivery, so Transaction Service deduplicates using the immutable event ID and durable `processed_events` state.
 
-## Consumer recovery
+## Consumer recovery and DLT indexing
 
 ```text
 payments.created.v1
@@ -127,7 +131,40 @@ Transaction Service
   |-- duplicate -----> no duplicate business write
   |-- retryable -----> retry 1 -> retry 2 -> DLT
   `-- malformed -----> DLT without useless retries
+                                      |
+                                      v
+                                DLT indexer
+                                      |
+                                      v
+                              dead_letter_events
 ```
+
+Each DLT record is uniquely indexed by `(dlt_topic, dlt_partition, dlt_offset)`, so indexer redelivery does not create duplicate recovery records. Spring Kafka DLT headers provide original topic/partition/offset/consumer-group and exception metadata when available.
+
+## Operational replay state machine
+
+```text
+PENDING ------> REPLAYING ------> REPLAYED
+   ^                |
+   |                |
+   +----- FAILED <--+
+```
+
+Replay does not hold a database lock while waiting for Kafka. The workflow is:
+
+1. atomically claim `PENDING`, `FAILED`, or stale `REPLAYING` state;
+2. record `replay_attempts`, `replay_claimed_at`, and the operator JWT subject;
+3. commit the claim;
+4. publish the original key/payload to the original source topic;
+5. mark `REPLAYED` after broker acknowledgement, or `FAILED` with `last_replay_error` on failure.
+
+A `REPLAYING` claim older than 30 seconds may be reclaimed after an instance crash. Two live operators cannot intentionally claim the same record at the same time.
+
+Replay remains **at least once**. A crash after Kafka acknowledgement but before the `REPLAYED` update can lead to a later duplicate replay. The durable `processed_events` consumer guard makes the duplicate business effect safe.
+
+The recovery API intentionally does not support editing a financial event payload before replay. A poison record should be replayed only after the underlying producer/data/application issue is corrected; payload mutation would require a separate audited correction workflow.
+
+See [`dlt-recovery.md`](dlt-recovery.md) for the operational runbook.
 
 ## API contract boundary
 
@@ -135,65 +172,45 @@ springdoc derives the Payment Service OpenAPI document from controller metadata,
 
 ## Observability plane
 
-### Metrics
-
-Both services use Micrometer and the Prometheus registry. Common `application` and `environment` tags make multi-service queries explicit.
-
 Payment Service domain metrics:
 
 - `payments.outbox.events` with `status=pending|processing|failed`
 - `payments.outbox.publish.events` with `outcome=success|failure`
 - `payments.outbox.publish.latency`
 
-Transaction Service domain metrics:
+Transaction Service domain/recovery metrics:
 
 - `transactions.payment.events` with `outcome=received|created|duplicate|malformed`
 - `transactions.payment.processing.latency` with `outcome=created|duplicate`
 - `transactions.kafka.dlt`
+- `transactions.kafka.dlt.indexed`
+- `transactions.kafka.dlt.backlog`
+- `transactions.kafka.dlt.replay` with `outcome=success|failure`
 
-Framework telemetry includes HTTP server metrics, JVM/runtime metrics, datasource instrumentation, and Kafka observations. Histograms are enabled for the latency series used in p95 dashboard queries.
+Framework telemetry includes HTTP server metrics, JVM/runtime metrics, datasource instrumentation, and Kafka observations. Histograms are enabled for latency series used in dashboard queries.
 
-### Tracing
+## Important outbox trace boundary
 
-Both services include Spring Boot OpenTelemetry support. Trace export is opt-in through:
+The transactional outbox stores the business event payload but **does not persist the original HTTP trace context**. The original payment request therefore commits before a later scheduled relay starts publishing the outbox event. Kafka observation can propagate context from the relay-produced record to Transaction Service, but that relay trace should not be presented as a continuous child of the earlier HTTP request.
 
-```text
-OTEL_TRACING_ENABLED=true
-OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
-TRACING_SAMPLING_PROBABILITY=1.0
-```
-
-Tempo receives OTLP HTTP traces locally. Grafana is provisioned with Tempo and Prometheus data sources.
-
-### Important outbox trace boundary
-
-The transactional outbox currently stores the business event payload but **does not persist the original HTTP trace context**. The original payment request therefore commits before a later scheduled relay starts publishing the outbox event. Kafka observation can propagate context from the relay-produced record to Transaction Service, but that relay trace should not be presented as a continuous child of the earlier HTTP request.
-
-Persisting W3C trace context alongside the outbox record would be a separate future design choice. Keeping this limitation explicit avoids misleading trace topology.
-
-## Local observability profile
-
-`docker compose --profile observability up -d` provisions:
-
-- Prometheus on `localhost:9090`
-- Grafana on `localhost:3000`
-- Tempo query/API on `localhost:3200`
-- Tempo OTLP HTTP receiver on `localhost:4318`
-
-Grafana automatically loads Prometheus and Tempo data sources plus the `Event-Driven Payment Platform` dashboard. Anonymous admin access exists only in this developer profile.
+Persisting W3C trace context alongside the outbox record would be a separate future design choice.
 
 ## Verification
 
-CI performs three layers of verification:
+CI validates the Compose/Grafana configuration and runs the complete Maven/Testcontainers reactor.
 
-1. `docker compose --profile observability config` validates the composed infrastructure definition.
-2. Python parses the provisioned Grafana dashboard JSON.
-3. `mvn --batch-mode test` runs the full unit and Testcontainers suite.
+Payment Service integration coverage includes PostgreSQL/Redis idempotency, rollback behavior, customer isolation, outbox claiming, OAuth2 authorization, OpenAPI, and protected Prometheus metrics.
 
-The Payment Service integration suite also requests `/actuator/prometheus` through the Spring Security filter chain with `ops:read` and checks that the custom outbox metric family is present.
+Transaction Service integration coverage now verifies:
 
-The existing PostgreSQL/Redis tests continue to cover concurrent idempotency, rollback behavior, customer isolation, outbox claiming, security, and OpenAPI. Transaction Service continues to use real Kafka + PostgreSQL to verify duplicate delivery and DLT behavior.
+- duplicate source events create one business transaction;
+- malformed source events reach the DLT;
+- DLT records are durably indexed with failure metadata;
+- a valid DLT record can be replayed into the original source topic and processed;
+- a `REPLAYED` record is idempotent on repeated replay requests;
+- DLT inspection requires `ops:read`;
+- replay requires `ops:write`.
 
 ## Remaining platform work
 
-The next high-value milestones are an operational DLT replay/recovery workflow, service expansion (notification/audit), Kubernetes/Helm deployment definitions, and an AWS deployment architecture.
+The next high-value milestones are service expansion (notification/audit), Kubernetes/Helm deployment definitions, and an AWS deployment architecture.

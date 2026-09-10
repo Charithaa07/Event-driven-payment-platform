@@ -31,6 +31,20 @@ spring:
 topics:
   payment-created: payments.created.v1
 
+security:
+  jwt:
+    issuer: ${JWT_ISSUER_URI:https://auth.example.com/}
+    audience: ${TRANSACTION_JWT_AUDIENCE:transaction-ops-api}
+    jwk-set-uri: ${JWT_JWK_SET_URI:http://localhost:9000/oauth2/jwks}
+  observability:
+    public-prometheus: ${OBSERVABILITY_PUBLIC_PROMETHEUS:false}
+
+dlt:
+  indexer:
+    group-id: ${DLT_INDEXER_GROUP_ID:transaction-service-dlt-indexer}
+  replay:
+    publish-timeout-ms: ${DLT_REPLAY_PUBLISH_TIMEOUT_MS:10000}
+
 management:
   endpoints:
     web:
