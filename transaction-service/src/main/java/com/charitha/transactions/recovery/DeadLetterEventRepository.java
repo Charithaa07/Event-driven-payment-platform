@@ -17,10 +17,14 @@ public interface DeadLetterEventRepository extends JpaRepository<DeadLetterEvent
     @Query(value = """
             INSERT INTO dead_letter_events (
                 id, source_topic, dlt_topic, dlt_partition, dlt_offset,
-                message_key, payload, status, received_at, replay_attempts
+                original_partition, original_offset, original_consumer_group,
+                message_key, payload, failure_class, failure_message,
+                status, received_at, replay_attempts
             ) VALUES (
                 :id, :sourceTopic, :dltTopic, :dltPartition, :dltOffset,
-                :messageKey, :payload, 'PENDING', :receivedAt, 0
+                :originalPartition, :originalOffset, :originalConsumerGroup,
+                :messageKey, :payload, :failureClass, :failureMessage,
+                'PENDING', :receivedAt, 0
             )
             ON CONFLICT (dlt_topic, dlt_partition, dlt_offset) DO NOTHING
             """, nativeQuery = true)
@@ -30,8 +34,13 @@ public interface DeadLetterEventRepository extends JpaRepository<DeadLetterEvent
             @Param("dltTopic") String dltTopic,
             @Param("dltPartition") int dltPartition,
             @Param("dltOffset") long dltOffset,
+            @Param("originalPartition") Integer originalPartition,
+            @Param("originalOffset") Long originalOffset,
+            @Param("originalConsumerGroup") String originalConsumerGroup,
             @Param("messageKey") String messageKey,
             @Param("payload") String payload,
+            @Param("failureClass") String failureClass,
+            @Param("failureMessage") String failureMessage,
             @Param("receivedAt") Instant receivedAt);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
