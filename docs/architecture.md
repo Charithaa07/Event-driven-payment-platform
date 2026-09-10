@@ -1,56 +1,48 @@
 # Architecture Notes
 
-## Phase 12 system flow
+## Phase 13 system flow
 
 1. Payment Service authenticates customer requests, applies customer-scoped idempotency, and commits a payment plus `payments.created.v1` outbox row atomically.
 2. The outbox relay claims rows with `FOR UPDATE SKIP LOCKED`, commits the claim, then publishes outside the database transaction.
-3. Kafka fan-out uses independent consumer groups: Transaction Service updates business state, Audit Service preserves immutable evidence, and Notification Service creates durable delivery work.
-4. Transaction Service atomically writes its transaction plus durable `processed_events` deduplication state.
-5. Transaction failures receive bounded retries and then move to `payments.created.v1.DLT`; DLT records are indexed for secured operational replay.
-6. Audit Service validates the event contract, computes a SHA-256 record digest, and inserts one append-only row; malformed audit input is isolated to `payments.created.v1.audit.DLT`.
-7. Notification Service inserts one `PENDING` EMAIL delivery per logical `(source_event_id, channel)` using PostgreSQL `ON CONFLICT DO NOTHING`.
-8. A scheduled notification dispatcher claims due work with `FOR UPDATE SKIP LOCKED`, changes rows to `PROCESSING`, and commits before making the provider call.
-9. Provider success persists `SENT`; retryable failures persist `RETRY_PENDING` with bounded exponential backoff; permanent or exhausted failures persist `FAILED`.
-10. Stale `PROCESSING` rows are reclaimable after the configured lease timeout, allowing crash recovery across service instances.
-11. Notification Kafka-ingestion failures use the independent `payments.created.v1.notification.DLT`; provider delivery failures remain in the Notification database because they occur after ingestion has succeeded.
-12. Payment, Transaction, Audit, and Notification services expose Micrometer telemetry and can export OpenTelemetry traces over OTLP.
+3. Kafka fan-out uses independent consumer groups: Transaction updates business state, Audit preserves immutable evidence, and Notification creates durable delivery work.
+4. Transaction Service writes its transaction plus `processed_events` deduplication state atomically; failures receive bounded retry and durable DLT recovery.
+5. Audit Service validates the event contract, computes a SHA-256 digest, and inserts one append-only row; malformed input is isolated to the audit DLT.
+6. Notification Service inserts one durable delivery request per `(source_event_id, channel)`, then a leased dispatcher performs provider calls outside the claim transaction.
+7. All four services expose Micrometer telemetry and optional OpenTelemetry/OTLP traces.
+8. Kubernetes runs each service as an independently scalable Deployment behind a ClusterIP Service. Helm owns application compute/configuration while databases, Kafka, Redis, identity, and telemetry backends remain external dependencies.
 
 ## Runtime architecture
 
 ```text
-OAuth2/OIDC Provider
-        |
-        | JWKS
-        +----------------+----------------+----------------+
-        v                v                v                v
-Payment Service   Transaction Service   Audit Service   Notification Service
-     |                    |                |                |
-     +-> Redis            +-> Tx DB        +-> Audit DB     +-> Notification DB
-     +-> Payment DB       |   + processed  |   append-only  |   durable states
-            |             |   + DLT index  |   SHA-256      |       |
-            v             |                |                |       v
-          Outbox          |                |                |   Leased dispatcher
-            |             |                |                |       |
-       Outbox Relay       |                |                |       v
-            |             |                |                |   Provider adapter
-            +-------------------------> Kafka <-------------+
-                                      |
-                   +------------------+------------------+
-                   |                  |                  |
-                   v                  v                  v
-             Transaction group    Audit group      Notification group
-                   |                  |                  |
-                   v                  v                  v
-        payments.created.v1.DLT  .audit.DLT       .notification.DLT
+                          optional Ingress
+                               |
+             +-----------------+------------------+
+             |                 |                  |
+             v                 v                  v
+      Payment Service   Transaction Service   Audit / Notification Services
+             |                 |                  |
+      Payment Deployment Transaction Deployment  Audit / Notification Deployments
+             |                 |                  |
+       Payment DB + Redis   Transaction DB     Audit DB / Notification DB
+             |                 |                  |
+             +-----------------+------------------+
+                               |
+                              Kafka
+                               |
+                    independent consumer groups
 
-All services ---- Prometheus / OTLP ----> Grafana + Tempo
+OAuth2/OIDC JWKS --------------------> all application Deployments
+OTLP collector <---------------------- all application Deployments
+
+Helm: Deployments + Services + ConfigMap + Secret references + HPA + PDB + optional Ingress
+External infrastructure: PostgreSQL + Kafka + Redis + OIDC/JWKS + OTLP backend
 ```
 
 Each service owns its own database and never reads another service's tables. Consumer-group independence means one downstream service can be unavailable without gating another consumer's work.
 
 ## Payment correctness boundary
 
-PostgreSQL remains authoritative for customer-scoped idempotency. Redis is an optimization, and the transactional outbox is the durable boundary between payment state and Kafka intent.
+PostgreSQL remains authoritative for customer-scoped idempotency. Redis is an optimization, and the transactional outbox is the durable boundary between payment state and Kafka intent. Outbox publication remains intentionally at least once.
 
 ## Transaction processing and DLT recovery
 
@@ -62,31 +54,16 @@ Audit Service preserves immutable integration-boundary evidence rather than muta
 
 ## Notification Service correctness model
 
-Notification delivery has two separate failure domains: Kafka ingestion and the external provider boundary. Keeping them separate avoids treating a temporary email/SMS provider outage as a poisoned Kafka record.
-
-### Idempotent ingestion
+Notification delivery has two separate failure domains: Kafka ingestion and the external provider boundary. Keeping them separate avoids treating a temporary provider outage as a poisoned Kafka record.
 
 ```text
 payments.created.v1
       |
       v
-parse + validate PaymentCreatedEvent
+INSERT notification_deliveries
+ON CONFLICT (source_event_id, channel) DO NOTHING
       |
       v
-INSERT notification_deliveries
-  source_event_id
-  channel=EMAIL
-  status=PENDING
-  attempt_count=0
-  next_attempt_at=now
-ON CONFLICT (source_event_id, channel) DO NOTHING
-```
-
-The unique `(source_event_id, channel)` constraint is the durable logical deduplication boundary. A Kafka replay can create another broker delivery without creating another notification request.
-
-### Leased multi-instance dispatch
-
-```text
 PENDING / RETRY_PENDING / stale PROCESSING
       |
       v
@@ -109,27 +86,38 @@ provider.send(idempotencyKey = notificationId)
    `--> permanent / exhausted --> FAILED
 ```
 
-The provider call intentionally runs outside the database transaction. This avoids holding row locks during network I/O and allows several Notification Service instances to claim disjoint batches. If an instance dies after claiming but before completion, `PROCESSING` becomes eligible again after the lease timeout.
+The provider call runs outside the database transaction, keeping locks short and allowing multiple instances to claim disjoint batches. Stale `PROCESSING` rows become eligible after the lease timeout. A crash can happen after provider acceptance but before `SENT` is stored, so the same notification ID is reused as the provider idempotency key. End-to-end exactly-once provider delivery is not claimed.
 
-### Provider exactly-once boundary
+## Kubernetes workload boundary
 
-A crash can occur after an external provider accepts a message but before Notification Service persists `SENT`. Retrying that row can therefore call the provider again. The same stable notification ID is passed as the provider idempotency key on every attempt. A production provider adapter should forward that key to a provider-side idempotency facility when available.
+Phase 13 introduces a deployment boundary without changing service correctness semantics.
 
-The platform deliberately does **not** claim end-to-end exactly-once notification delivery. The built-in `LoggingNotificationProvider` is a local development adapter and performs no real email/SMS network call.
+### Application compute only
 
-### Retry and terminal state
+The Helm chart deliberately does not create PostgreSQL, Kafka, Redis, OIDC, or tracing infrastructure. Those endpoints are supplied through values and a shared runtime ConfigMap. Database usernames/passwords are referenced from an existing Kubernetes Secret. This keeps the chart cloud-neutral and allows a later AWS mapping to RDS, MSK, ElastiCache, an external identity provider, and a managed/hosted telemetry stack.
 
-Retryable provider failures use exponential backoff bounded by `base-backoff-ms`, `max-backoff-ms`, and `max-attempts`. A non-retryable provider exception goes directly to `FAILED`. Provider failures remain inspectable through the delivery API and are not sent to the Kafka DLT because the source event was already ingested successfully.
+### Availability and rollout
 
-### Kafka ingestion DLT
+Each application has:
 
-Malformed deterministic input is not retried pointlessly. Other ingestion failures receive bounded Kafka retry before recovery to:
+- a Deployment and internal ClusterIP Service;
+- rolling updates with `maxUnavailable: 0` and `maxSurge: 1`;
+- startup, readiness, and liveness probes using Actuator health groups;
+- graceful Spring shutdown within the pod termination window;
+- resource requests/limits;
+- `autoscaling/v2` HPA policies;
+- a PodDisruptionBudget;
+- hostname topology spreading.
 
-```text
-payments.created.v1.notification.DLT
-```
+HPA replica growth does not imply unlimited Kafka throughput. Effective consumer parallelism still depends on partition count, PostgreSQL capacity, connection pools, and notification-provider quotas.
 
-This topic is intentionally different from Transaction and Audit DLTs because each consumer has independent responsibilities and recovery semantics.
+### Container security
+
+The shared runtime image and pod spec use a non-root UID/GID, dropped Linux capabilities, `allowPrivilegeEscalation: false`, `RuntimeDefault` seccomp, and a read-only root filesystem. A writable `emptyDir` is mounted at `/tmp` for JVM compatibility. Service-account tokens are not mounted because the applications do not call the Kubernetes API.
+
+### Configuration and secrets
+
+Non-secret runtime settings are exposed through a ConfigMap. Database credential keys are loaded from an existing Secret, which can be created by a deployment system, External Secrets operator, or Secrets Store CSI integration. Real credentials are never committed to the repository.
 
 ## Security boundaries
 
@@ -152,33 +140,23 @@ All services
   ops:read -> protected metrics / Prometheus
 ```
 
-All four services validate configured JWT signature/JWKS, issuer, audience, timing, and a non-empty subject.
+All four services validate configured JWT signature/JWKS, issuer, audience, timing, and a non-empty subject. Kubernetes ServiceAccounts are not used as an application authentication substitute.
 
 ## Observability plane
 
-Notification Service adds:
+Prometheus/Micrometer metrics cover outbox publication, transaction processing/DLT behavior, audit ingestion, and notification ingestion/provider attempts. OpenTelemetry export remains opt-in. HTTP, Kafka, scheduled outbox, and later provider-dispatch work can form separate traces where trace context is not persisted across durable boundaries.
 
-```text
-notifications.ingestion.events{outcome=received|stored|duplicate|malformed|dead_lettered}
-notifications.delivery.attempts{outcome=sent|retry_scheduled|failed}
-```
+## Deployment verification
 
-Prometheus scrapes ports `8080`, `8081`, `8082`, and `8083`. OpenTelemetry export remains opt-in. The Kafka listener trace and later scheduled provider-dispatch trace are separate because trace context is not persisted with the notification row.
+CI validates the deployment artifacts as executable infrastructure rather than static examples:
 
-## Container-backed verification
+- `helm lint` validates the chart;
+- `helm template` renders the default chart and CI asserts four Deployments, Services, HPAs, and PDBs;
+- the full Maven reactor runs through `verify`;
+- each packaged service jar is placed into the shared hardened runtime image, proving all four image contracts build.
 
-CI runs infrastructure configuration validation plus the entire Maven reactor. Notification Service uses real Kafka + PostgreSQL containers to verify:
-
-- duplicate logical payment events create one notification row;
-- a transient provider failure persists retry state and later reaches `SENT` on a second attempt;
-- a permanent provider failure reaches `FAILED` after one attempt;
-- malformed JSON reaches `payments.created.v1.notification.DLT`;
-- unauthenticated notification queries return `401`;
-- tokens without `notification:read` return `403`;
-- the generated OpenAPI contract remains public.
-
-The existing Payment, Transaction, and Audit Testcontainers suites continue to verify their respective correctness boundaries.
+Application Testcontainers suites continue to verify their database/Kafka/Redis correctness boundaries independently of Kubernetes packaging.
 
 ## Future expansion
 
-The next useful infrastructure milestone is packaging these service boundaries for deployment: Kubernetes/Helm resources, configuration/secrets boundaries, readiness/liveness behavior, and an AWS deployment design. A real email/SMS provider adapter should remain a swappable edge component rather than leaking vendor APIs into the notification domain.
+The next infrastructure milestone is an AWS deployment architecture and cloud delivery pipeline. The Kubernetes values should map external dependencies to managed cloud services rather than introducing stateful database/Kafka workloads into the application chart. A real email/SMS provider adapter remains a swappable edge component with credentials supplied through the secret-management boundary.

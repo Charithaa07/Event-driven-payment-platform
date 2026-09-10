@@ -19,5 +19,30 @@ jobs:
         run: |
           docker compose --profile observability config >/dev/null
           python -m json.tool observability/grafana/dashboards/payment-platform.json >/dev/null
-      - name: Run tests
-        run: mvn --batch-mode test
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+      - name: Validate Helm deployment
+        run: |
+          helm lint deploy/helm/payment-platform
+          helm template payment-platform deploy/helm/payment-platform --namespace payments > /tmp/payment-platform.yaml
+          test "$(grep -c '^kind: Deployment$' /tmp/payment-platform.yaml)" -eq 4
+          test "$(grep -c '^kind: Service$' /tmp/payment-platform.yaml)" -eq 4
+          test "$(grep -c '^kind: HorizontalPodAutoscaler$' /tmp/payment-platform.yaml)" -eq 4
+          test "$(grep -c '^kind: PodDisruptionBudget$' /tmp/payment-platform.yaml)" -eq 4
+      - name: Run tests and package services
+        run: mvn --batch-mode verify
+      - name: Build runtime images
+        run: |
+          while IFS=: read -r service port; do
+            jar_file=$(find "$service/target" -maxdepth 1 -type f -name "$service-*.jar" ! -name "*.original" | head -n 1)
+            test -n "$jar_file"
+            docker build \
+              --build-arg JAR_FILE="$jar_file" \
+              --build-arg SERVICE_PORT="$port" \
+              -t "payment-platform/$service:ci" .
+          done <<'EOF'
+          payment-service:8080
+          transaction-service:8081
+          audit-service:8082
+          notification-service:8083
+          EOF

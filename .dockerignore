@@ -1,0 +1,13 @@
+.git
+.github
+docs
+deploy
+observability
+**/src
+**/.idea
+**/.vscode
+**/target/*
+!payment-service/target/payment-service-*.jar
+!transaction-service/target/transaction-service-*.jar
+!audit-service/target/audit-service-*.jar
+!notification-service/target/notification-service-*.jar

@@ -1,0 +1,181 @@
+fullnameOverride: ""
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+
+global:
+  environment: kubernetes
+  kafkaBootstrapServers: kafka:9092
+  redisHost: redis
+  redisPort: 6379
+  jwtIssuerUri: https://auth.example.com/
+  jwtJwkSetUri: https://auth.example.com/.well-known/jwks.json
+  tracingSamplingProbability: "0.10"
+  otelTracingEnabled: false
+  otelTracesEndpoint: http://otel-collector:4318/v1/traces
+  observabilityPublicPrometheus: false
+
+secrets:
+  # The chart never creates database credentials. Create this Secret out of band
+  # (or replace it with an ExternalSecret/Secrets Store CSI integration).
+  existingSecret: payment-platform-secrets
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: payments.example.com
+  tls: []
+  paths:
+    - path: /api/v1/payments
+      pathType: Prefix
+      service: payment
+    - path: /api/v1/operations
+      pathType: Prefix
+      service: transaction
+    - path: /api/v1/audit
+      pathType: Prefix
+      service: audit
+    - path: /api/v1/notifications
+      pathType: Prefix
+      service: notification
+
+services:
+  payment:
+    enabled: true
+    image:
+      repository: ghcr.io/charithaa07/payment-service
+      tag: latest
+      pullPolicy: IfNotPresent
+    port: 8080
+    replicas: 2
+    database:
+      url: jdbc:postgresql://payment-postgres:5432/payments
+      urlEnv: DB_URL
+      userEnv: DB_USER
+      passwordEnv: DB_PASSWORD
+      userSecretKey: payment-db-user
+      passwordSecretKey: payment-db-password
+    jwt:
+      audienceEnv: JWT_AUDIENCE
+      audience: payment-api
+    redis:
+      enabled: true
+    resources:
+      requests:
+        cpu: 250m
+        memory: 384Mi
+      limits:
+        cpu: "1"
+        memory: 768Mi
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 8
+      targetCPUUtilizationPercentage: 70
+
+  transaction:
+    enabled: true
+    image:
+      repository: ghcr.io/charithaa07/transaction-service
+      tag: latest
+      pullPolicy: IfNotPresent
+    port: 8081
+    replicas: 2
+    database:
+      url: jdbc:postgresql://transaction-postgres:5432/transactions
+      urlEnv: TRANSACTION_DB_URL
+      userEnv: TRANSACTION_DB_USER
+      passwordEnv: TRANSACTION_DB_PASSWORD
+      userSecretKey: transaction-db-user
+      passwordSecretKey: transaction-db-password
+    jwt:
+      audienceEnv: TRANSACTION_JWT_AUDIENCE
+      audience: transaction-ops-api
+    redis:
+      enabled: false
+    resources:
+      requests:
+        cpu: 250m
+        memory: 384Mi
+      limits:
+        cpu: "1"
+        memory: 768Mi
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 8
+      targetCPUUtilizationPercentage: 70
+
+  audit:
+    enabled: true
+    image:
+      repository: ghcr.io/charithaa07/audit-service
+      tag: latest
+      pullPolicy: IfNotPresent
+    port: 8082
+    replicas: 2
+    database:
+      url: jdbc:postgresql://audit-postgres:5432/audit
+      urlEnv: AUDIT_DB_URL
+      userEnv: AUDIT_DB_USER
+      passwordEnv: AUDIT_DB_PASSWORD
+      userSecretKey: audit-db-user
+      passwordSecretKey: audit-db-password
+    jwt:
+      audienceEnv: AUDIT_JWT_AUDIENCE
+      audience: audit-api
+    redis:
+      enabled: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 320Mi
+      limits:
+        cpu: "1"
+        memory: 640Mi
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+
+  notification:
+    enabled: true
+    image:
+      repository: ghcr.io/charithaa07/notification-service
+      tag: latest
+      pullPolicy: IfNotPresent
+    port: 8083
+    replicas: 2
+    database:
+      url: jdbc:postgresql://notification-postgres:5432/notifications
+      urlEnv: NOTIFICATION_DB_URL
+      userEnv: NOTIFICATION_DB_USER
+      passwordEnv: NOTIFICATION_DB_PASSWORD
+      userSecretKey: notification-db-user
+      passwordSecretKey: notification-db-password
+    jwt:
+      audienceEnv: NOTIFICATION_JWT_AUDIENCE
+      audience: notification-api
+    redis:
+      enabled: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 320Mi
+      limits:
+        cpu: "1"
+        memory: 640Mi
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70

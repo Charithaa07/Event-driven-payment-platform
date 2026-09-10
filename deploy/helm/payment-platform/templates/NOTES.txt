@@ -1,0 +1,7 @@
+The Event-Driven Payment Platform application workloads are installed.
+
+Check rollout status:
+  kubectl get deployments,pods,hpa,pdb -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
+
+The chart expects the Secret "{{ .Values.secrets.existingSecret }}" to exist before pods can start.
+Stateful dependencies (PostgreSQL, Kafka, Redis, OIDC/JWKS and OTLP) are intentionally external to this chart.
