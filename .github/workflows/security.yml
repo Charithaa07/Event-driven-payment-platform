@@ -57,13 +57,15 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - name: Package services for dependency and image scanning
-        run: mvn --batch-mode -DskipTests package
+      - name: Package services and populate Maven dependency cache
+        run: |
+          mvn --batch-mode -DskipTests package
+          mvn --batch-mode -DskipTests dependency:resolve
+          mkdir -p "$RUNNER_TEMP/trivy-cache" security-reports
 
       - name: Generate aggregate CycloneDX SBOM
         run: |
           set -euo pipefail
-          mkdir -p security-reports
           mvn --batch-mode \
             org.cyclonedx:cyclonedx-maven-plugin:2.9.3:makeAggregateBom \
             -DoutputFormat=json \
@@ -75,8 +77,11 @@ jobs:
         run: |
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
+            -v "$HOME/.m2:/root/.m2:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
             "$TRIVY_IMAGE" fs \
             --scanners secret \
+            --offline-scan \
             --exit-code 1 \
             --no-progress \
             .
@@ -85,6 +90,7 @@ jobs:
         run: |
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
             "$TRIVY_IMAGE" fs \
             --scanners misconfig \
             --severity HIGH,CRITICAL \
@@ -96,10 +102,13 @@ jobs:
         run: |
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
+            -v "$HOME/.m2:/root/.m2:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
             "$TRIVY_IMAGE" fs \
             --scanners vuln \
             --severity CRITICAL \
             --ignore-unfixed \
+            --offline-scan \
             --exit-code 1 \
             --no-progress \
             .
@@ -110,10 +119,13 @@ jobs:
           mkdir -p security-reports
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace \
+            -v "$HOME/.m2:/root/.m2:ro" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
             "$TRIVY_IMAGE" fs \
             --scanners vuln,misconfig,secret \
             --severity HIGH,CRITICAL \
             --ignore-unfixed \
+            --offline-scan \
             --format sarif \
             --output security-reports/trivy-repository.sarif \
             --no-progress \
@@ -143,10 +155,12 @@ jobs:
 
             docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
               "$TRIVY_IMAGE" image \
               --scanners vuln \
               --severity CRITICAL \
               --ignore-unfixed \
+              --offline-scan \
               --exit-code 1 \
               --no-progress \
               "$image"
@@ -154,9 +168,11 @@ jobs:
             docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v "$PWD:/workspace" -w /workspace \
+              -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
               "$TRIVY_IMAGE" image \
               --format cyclonedx \
               --output "security-reports/images/${service}.cdx.json" \
+              --offline-scan \
               --no-progress \
               "$image"
           done <<'EOF'
