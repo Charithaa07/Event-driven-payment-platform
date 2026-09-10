@@ -81,6 +81,11 @@ jobs:
       - name: Configure kubectl for EKS
         run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
 
+      - name: Verify bootstrap namespace
+        run: |
+          set -euo pipefail
+          kubectl get namespace "$K8S_NAMESPACE" >/dev/null
+
       - name: Discover managed service endpoints
         run: |
           set -euo pipefail
@@ -166,7 +171,6 @@ jobs:
             echo "::add-mask::$value"
           done
 
-          kubectl create namespace "$K8S_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
           kubectl -n "$K8S_NAMESPACE" create secret generic payment-platform-secrets \
             --from-literal=payment-db-user="$PAYMENT_USER" \
             --from-literal=payment-db-password="$PAYMENT_PASSWORD" \
@@ -187,7 +191,6 @@ jobs:
           set -euo pipefail
           helm upgrade --install "$HELM_RELEASE" deploy/helm/payment-platform \
             --namespace "$K8S_NAMESPACE" \
-            --create-namespace \
             -f deploy/helm/payment-platform/values-aws.yaml \
             --set-string global.kafkaBootstrapServers="$KAFKA_BOOTSTRAP" \
             --set-string global.redisHost="$REDIS_HOST" \
