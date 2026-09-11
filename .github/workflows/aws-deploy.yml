@@ -19,7 +19,7 @@ concurrency:
 jobs:
   deploy:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, aws-private]
     environment: production
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
