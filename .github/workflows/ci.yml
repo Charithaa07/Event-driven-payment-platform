@@ -67,12 +67,12 @@ jobs:
           grep -q 'SPRING_DATA_REDIS_SSL_ENABLED' /tmp/payment-platform-aws.yaml
           grep -q 'serviceAccountName: payment-platform-payment' /tmp/payment-platform-aws.yaml
 
-      - name: Scan source and infrastructure
+      - name: Scan secrets and infrastructure
         run: |
           docker run --rm \
             -v "$PWD:/workspace" \
             aquasec/trivy:0.74.0 \
-            fs --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 /workspace
+            fs --scanners secret --exit-code 1 /workspace
 
           docker run --rm \
             -v "$PWD:/workspace" \
@@ -81,6 +81,16 @@ jobs:
 
       - name: Run tests and package services
         run: mvn --batch-mode verify
+
+      - name: Scan Java dependencies
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -v "$HOME/.m2:/root/.m2:ro" \
+            aquasec/trivy:0.74.0 \
+            fs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            --skip-dirs /workspace/deploy/aws/terraform/.terraform \
+            /workspace
 
       - name: Build runtime images
         run: |
