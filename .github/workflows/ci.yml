@@ -67,8 +67,33 @@ jobs:
           grep -q 'SPRING_DATA_REDIS_SSL_ENABLED' /tmp/payment-platform-aws.yaml
           grep -q 'serviceAccountName: payment-platform-payment' /tmp/payment-platform-aws.yaml
 
+      - name: Scan secrets and infrastructure
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            aquasec/trivy:0.74.0 \
+            fs --scanners secret --exit-code 1 \
+            --skip-files '**/pom.xml' \
+            --skip-dirs /workspace/deploy/aws/terraform/.terraform \
+            /workspace
+
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            aquasec/trivy:0.74.0 \
+            config --severity HIGH,CRITICAL --exit-code 1 /workspace/deploy
+
       - name: Run tests and package services
         run: mvn --batch-mode verify
+
+      - name: Scan Java dependencies
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -v "$HOME/.m2:/root/.m2:ro" \
+            aquasec/trivy:0.74.0 \
+            fs --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            --skip-dirs /workspace/deploy/aws/terraform/.terraform \
+            /workspace
 
       - name: Build runtime images
         run: |
@@ -85,3 +110,33 @@ jobs:
           audit-service:8082
           notification-service:8083
           EOF
+
+      - name: Scan runtime images
+        run: |
+          for service in payment-service transaction-service audit-service notification-service; do
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              aquasec/trivy:0.74.0 \
+              image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+              "payment-platform/$service:ci"
+          done
+
+      - name: Generate CycloneDX SBOMs
+        run: |
+          mkdir -p artifacts/sbom
+          for service in payment-service transaction-service audit-service notification-service; do
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$PWD/artifacts/sbom:/output" \
+              anchore/syft:v1.51.1 \
+              "payment-platform/$service:ci" \
+              -o "cyclonedx-json=/output/$service.cdx.json"
+          done
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyclonedx-sboms
+          path: artifacts/sbom/*.cdx.json
+          if-no-files-found: error
+          retention-days: 30
