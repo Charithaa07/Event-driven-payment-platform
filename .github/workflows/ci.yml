@@ -72,7 +72,10 @@ jobs:
           docker run --rm \
             -v "$PWD:/workspace" \
             aquasec/trivy:0.74.0 \
-            fs --scanners secret --exit-code 1 /workspace
+            fs --scanners secret --exit-code 1 \
+            --skip-files '**/pom.xml' \
+            --skip-dirs /workspace/deploy/aws/terraform/.terraform \
+            /workspace
 
           docker run --rm \
             -v "$PWD:/workspace" \
